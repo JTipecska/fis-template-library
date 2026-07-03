@@ -10,6 +10,35 @@ Browse the experiment directories to find templates for various fault injection 
 - **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
+- **SageMaker AI Pipeline Resilience**: `sagemaker-ai-pipeline-disruption/sagemaker-stop-pipeline-execution/`, `sagemaker-ai-pipeline-disruption/sagemaker-stop-processing-job/`, `sagemaker-ai-pipeline-disruption/sagemaker-stop-transform-job/`, `sagemaker-ai-pipeline-disruption/sagemaker-stop-training-job/`, `sagemaker-ai-pipeline-disruption/sagemaker-s3-dependency-impairment/`
+
+---
+
+## SageMaker AI Pipeline Resilience Experiments
+
+These experiments validate the resilience of AI/ML batch inference pipelines built on Amazon SageMaker. They cover the full spectrum of failure modes that can affect a pipeline — from stopping a running execution or individual job, to simulating loss of access to the S3 data dependency the pipeline relies on.
+
+See [`sagemaker-ai-pipeline-disruption/README.md`](sagemaker-ai-pipeline-disruption/README.md) for the end-to-end use case, architecture context, and recommended experiment sequencing.
+
+### Experiment Overview
+
+| Experiment | Fault type | Reversible? | Key design note |
+|---|---|---|---|
+| [`sagemaker-stop-pipeline-execution`](sagemaker-ai-pipeline-disruption/sagemaker-stop-pipeline-execution/) | Stops executing SageMaker pipeline executions | No | Discovers via tagged **pipelines** (not executions — pipeline executions cannot be tagged directly); stops all `Executing` executions found on matching pipelines |
+| [`sagemaker-stop-processing-job`](sagemaker-ai-pipeline-disruption/sagemaker-stop-processing-job/) | Stops `InProgress` SageMaker processing jobs | No | Direct pattern match to the training-job experiment; tags applied to the processing job resource itself |
+| [`sagemaker-stop-transform-job`](sagemaker-ai-pipeline-disruption/sagemaker-stop-transform-job/) | Stops `InProgress` SageMaker batch transform jobs | No | Direct pattern match to the training-job experiment; validates that downstream Glue jobs and data consumers handle missing or partial inference output |
+| [`sagemaker-stop-training-job`](sagemaker-ai-pipeline-disruption/sagemaker-stop-training-job/) | Stops `InProgress` SageMaker training jobs | No | Baseline pattern — all other job-stop experiments follow this same discovery → stop → observe → verify sequence |
+| [`sagemaker-s3-dependency-impairment`](sagemaker-ai-pipeline-disruption/sagemaker-s3-dependency-impairment/) | Denies `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject` on tagged S3 buckets | **Yes** | Injects a `FISTemporaryDeny` bucket policy statement and always removes it via `onFailure`/`onCancel` handlers; uses `emptyTargetResolutionMode: skip` to prevent failure when no tagged buckets exist |
+
+### Notable differences from the training-job pattern
+
+The `sagemaker-stop-training-job` experiment is the baseline. The other experiments diverge from it in the following ways:
+
+- **`sagemaker-stop-pipeline-execution`**: Cannot tag a pipeline execution directly, so targeting is indirect — the SSM Automation lists pipelines tagged `FIS-Ready=True` and then queries each pipeline's active executions. This means the `FIS-Ready` tag must be on the **pipeline resource**, not the execution.
+
+- **`sagemaker-s3-dependency-impairment`**: The only **reversible** fault in this group. Rather than a one-way stop, it injects a deny bucket policy for a configurable duration and then restores the original policy. The restore step is wired to `onFailure` and `onCancel` to guarantee cleanup even if the experiment is interrupted. This experiment tests a different hypothesis to the job-stop experiments: it validates that SageMaker jobs fail with a clear, observable error when S3 becomes inaccessible, rather than hanging indefinitely.
+
+- **`sagemaker-stop-processing-job`** and **`sagemaker-stop-transform-job`**: Structurally identical to the training-job experiment, but they surface a different observable: whether a parent SageMaker pipeline correctly propagates a step failure and whether downstream consumers (e.g., a Glue job writing results to a data product) detect and alert on partial or missing output from the failed step.
 
 Each experiment directory contains:
 - Complete FIS experiment template (JSON)
