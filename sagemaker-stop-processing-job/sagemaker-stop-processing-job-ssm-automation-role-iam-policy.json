@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSageMakerProcessingJobDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListProcessingJobs",
+        "sagemaker:ListTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSageMakerProcessingJobStop",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:StopProcessingJob",
+        "sagemaker:DescribeProcessingJob"
+      ],
+      "Resource": "arn:aws:sagemaker:<YOUR REGION>:<YOUR AWS ACCOUNT>:processing-job/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    }
+  ]
+}

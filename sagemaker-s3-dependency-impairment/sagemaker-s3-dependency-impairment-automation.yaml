@@ -1,0 +1,202 @@
+description: "Apply a deny policy to S3 buckets with a specific tag to simulate S3 dependency unavailability during SageMaker pipeline or job execution"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify S3 buckets to impair"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify S3 buckets to impair"
+    default: "True"
+  duration:
+    type: String
+    description: "Duration of the S3 impairment in ISO8601 format"
+    default: "PT10M"
+  region:
+    type: String
+    description: "AWS Region of the S3 buckets"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: discoverTargetBuckets
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: discover_buckets
+      Script: |
+        import boto3
+
+        def discover_buckets(events, context):
+            tag_key = events['tagKey']
+            tag_value = events['tagValue']
+
+            s3 = boto3.client('s3')
+            target_buckets = []
+
+            response = s3.list_buckets()
+            for bucket in response.get('Buckets', []):
+                bucket_name = bucket['Name']
+                try:
+                    tags_response = s3.get_bucket_tagging(Bucket=bucket_name)
+                    tags = {t['Key']: t['Value'] for t in tags_response.get('TagSet', [])}
+                    if tags.get(tag_key) == tag_value:
+                        target_buckets.append(bucket_name)
+                except s3.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'NoSuchTagSet':
+                        continue
+                    print(f"Error retrieving tags for bucket {bucket_name}: {str(e)}")
+                    continue
+
+            if not target_buckets:
+                raise RuntimeError(
+                    f"No S3 buckets found with tag {tag_key}={tag_value}. "
+                    "Ensure at least one bucket is tagged with FIS-Ready=True before starting the experiment."
+                )
+
+            print(f"Discovered {len(target_buckets)} target bucket(s): {target_buckets}")
+            return target_buckets
+      InputPayload:
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetBuckets
+        Selector: $.Payload
+        Type: StringList
+    description: "Find all S3 buckets with the specified tag"
+
+  - name: applyDenyPolicy
+    action: aws:executeScript
+    onFailure: "step:removeDenyPolicy"
+    onCancel: "step:removeDenyPolicy"
+    inputs:
+      Runtime: python3.11
+      Handler: apply_deny_policy
+      Script: |
+        import boto3
+        import json
+
+        def apply_deny_policy(events, context):
+            region = events['region']
+            target_buckets = events['targetBuckets']
+
+            s3 = boto3.client('s3', region_name=region)
+            results = []
+
+            for bucket_name in target_buckets:
+                try:
+                    existing_policy = {"Version": "2012-10-17", "Statement": []}
+                    try:
+                        response = s3.get_bucket_policy(Bucket=bucket_name)
+                        existing_policy = json.loads(response['Policy'])
+                    except s3.exceptions.ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchBucketPolicy':
+                            raise
+
+                    deny_statement = {
+                        "Sid": "FISTemporaryDeny",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:ListBucket",
+                            "s3:DeleteObject"
+                        ],
+                        "Resource": [
+                            f"arn:aws:s3:::{bucket_name}",
+                            f"arn:aws:s3:::{bucket_name}/*"
+                        ]
+                    }
+
+                    # Remove any prior FISTemporaryDeny to ensure idempotency
+                    existing_policy['Statement'] = [
+                        s for s in existing_policy.get('Statement', [])
+                        if s.get('Sid') != 'FISTemporaryDeny'
+                    ]
+                    existing_policy['Statement'].append(deny_statement)
+
+                    s3.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(existing_policy))
+                    results.append(f"Applied deny policy to {bucket_name}")
+                    print(f"Applied FISTemporaryDeny to bucket: {bucket_name}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to apply S3 deny policy to {bucket_name}: {e}") from e
+
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        targetBuckets: "{{ discoverTargetBuckets.targetBuckets }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Apply a deny policy blocking key S3 operations on all target buckets"
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:removeDenyPolicy"
+    onCancel: "step:removeDenyPolicy"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Wait for the specified duration while the S3 buckets are impaired"
+
+  - name: removeDenyPolicy
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: remove_deny_policy
+      Script: |
+        import boto3
+        import json
+
+        def remove_deny_policy(events, context):
+            region = events['region']
+            target_buckets = events['targetBuckets']
+
+            s3 = boto3.client('s3', region_name=region)
+            results = []
+
+            for bucket_name in target_buckets:
+                try:
+                    try:
+                        response = s3.get_bucket_policy(Bucket=bucket_name)
+                        current_policy = json.loads(response['Policy'])
+                    except s3.exceptions.ClientError as e:
+                        if e.response['Error']['Code'] == 'NoSuchBucketPolicy':
+                            results.append(f"{bucket_name}: no policy to restore")
+                            continue
+                        raise
+
+                    remaining = [
+                        s for s in current_policy.get('Statement', [])
+                        if s.get('Sid') != 'FISTemporaryDeny'
+                    ]
+
+                    if remaining:
+                        current_policy['Statement'] = remaining
+                        s3.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(current_policy))
+                        results.append(f"Removed FISTemporaryDeny from {bucket_name}")
+                    else:
+                        s3.delete_bucket_policy(Bucket=bucket_name)
+                        results.append(f"Deleted empty policy from {bucket_name}")
+
+                    print(f"Restored S3 access for bucket: {bucket_name}")
+                except Exception as e:
+                    results.append(f"Failed to restore policy for {bucket_name}: {str(e)}")
+                    print(f"Error restoring {bucket_name}: {str(e)}")
+
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        targetBuckets: "{{ discoverTargetBuckets.targetBuckets }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Remove the FISTemporaryDeny statement from all affected buckets to restore normal S3 access"
+    isEnd: true
