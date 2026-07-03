@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSageMakerTransformJobDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListTransformJobs",
+        "sagemaker:ListTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSageMakerTransformJobStop",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:StopTransformJob",
+        "sagemaker:DescribeTransformJob"
+      ],
+      "Resource": "arn:aws:sagemaker:<YOUR REGION>:<YOUR AWS ACCOUNT>:transform-job/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    }
+  ]
+}

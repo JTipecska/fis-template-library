@@ -1,0 +1,163 @@
+description: "Discover and stop running SageMaker pipeline executions with a specific tag to simulate pipeline execution interruption"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify SageMaker pipelines whose executions should be stopped"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify SageMaker pipelines whose executions should be stopped"
+    default: "True"
+  duration:
+    type: String
+    description: "Observation window duration in ISO8601 format after executions are stopped"
+    default: "PT10M"
+  region:
+    type: String
+    description: "AWS Region of the SageMaker pipelines"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: discoverPipelineExecutions
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: discover_pipeline_executions
+      Script: |
+        import boto3
+
+        def discover_pipeline_executions(events, context):
+            region = events['region']
+            tag_key = events['tagKey']
+            tag_value = events['tagValue']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            target_executions = []
+
+            # Pipelines are tagged; executions are not. Find tagged pipelines first.
+            paginator = sm.get_paginator('list_pipelines')
+            for page in paginator.paginate():
+                for pipeline in page.get('PipelineSummaries', []):
+                    pipeline_name = pipeline['PipelineName']
+                    pipeline_arn = pipeline['PipelineArn']
+                    try:
+                        tags_response = sm.list_tags(ResourceArn=pipeline_arn)
+                        tags = {t['Key']: t['Value'] for t in tags_response.get('Tags', [])}
+                        if tags.get(tag_key) != tag_value:
+                            continue
+                    except Exception as e:
+                        print(f"Error retrieving tags for pipeline {pipeline_name}: {str(e)}")
+                        continue
+
+                    # Pipeline is tagged — find its executing runs
+                    exec_paginator = sm.get_paginator('list_pipeline_executions')
+                    for exec_page in exec_paginator.paginate(PipelineName=pipeline_name):
+                        for execution in exec_page.get('PipelineExecutionSummaries', []):
+                            if execution.get('PipelineExecutionStatus') == 'Executing':
+                                target_executions.append(execution['PipelineExecutionArn'])
+
+            if not target_executions:
+                raise RuntimeError(
+                    f"No Executing SageMaker pipeline executions found for pipelines tagged {tag_key}={tag_value}. "
+                    "Ensure at least one pipeline execution is running and its pipeline is tagged before starting the experiment."
+                )
+
+            print(f"Discovered {len(target_executions)} executing pipeline execution(s): {target_executions}")
+            return target_executions
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetExecutions
+        Selector: $.Payload
+        Type: StringList
+    description: "Find all Executing SageMaker pipeline executions for pipelines with the specified tag"
+
+  - name: stopPipelineExecutions
+    action: aws:executeScript
+    onFailure: "step:verifyExecutionsStopped"
+    onCancel: "step:verifyExecutionsStopped"
+    inputs:
+      Runtime: python3.11
+      Handler: stop_pipeline_executions
+      Script: |
+        import boto3
+
+        def stop_pipeline_executions(events, context):
+            region = events['region']
+            target_executions = events['targetExecutions']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            stopped = []
+
+            for execution_arn in target_executions:
+                try:
+                    sm.stop_pipeline_execution(PipelineExecutionArn=execution_arn)
+                    stopped.append(execution_arn)
+                    print(f"Stop request sent for pipeline execution: {execution_arn}")
+                except sm.exceptions.ResourceNotFound:
+                    print(f"Pipeline execution {execution_arn} not found — may have already completed")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to stop pipeline execution {execution_arn}: {e}") from e
+
+            print(f"Stop requested for {len(stopped)} execution(s)")
+            return stopped
+      InputPayload:
+        region: "{{ region }}"
+        targetExecutions: "{{ discoverPipelineExecutions.targetExecutions }}"
+    outputs:
+      - Name: stoppedExecutions
+        Selector: $.Payload
+        Type: StringList
+    description: "Send stop request to all discovered pipeline executions"
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:verifyExecutionsStopped"
+    onCancel: "step:verifyExecutionsStopped"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Observation window — wait for downstream systems to react to the pipeline execution interruption"
+
+  - name: verifyExecutionsStopped
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: verify_executions_stopped
+      Script: |
+        import boto3
+
+        def verify_executions_stopped(events, context):
+            region = events['region']
+            stopped_executions = events['stoppedExecutions']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            results = []
+
+            for execution_arn in stopped_executions:
+                try:
+                    response = sm.describe_pipeline_execution(PipelineExecutionArn=execution_arn)
+                    status = response['PipelineExecutionStatus']
+                    results.append(f"{execution_arn}: {status}")
+                    print(f"Pipeline execution {execution_arn} final status: {status}")
+                except Exception as e:
+                    results.append(f"{execution_arn}: error retrieving status — {str(e)}")
+                    print(f"Could not retrieve status for {execution_arn}: {str(e)}")
+
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        stoppedExecutions: "{{ stopPipelineExecutions.stoppedExecutions }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Verify final status of all stopped pipeline executions and log results"
+    isEnd: true

@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSageMakerPipelineDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListPipelines",
+        "sagemaker:ListPipelineExecutions",
+        "sagemaker:ListTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSageMakerPipelineExecutionStop",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:StopPipelineExecution",
+        "sagemaker:DescribePipelineExecution"
+      ],
+      "Resource": "arn:aws:sagemaker:<YOUR REGION>:<YOUR AWS ACCOUNT>:pipeline/*/execution/*"
+    }
+  ]
+}

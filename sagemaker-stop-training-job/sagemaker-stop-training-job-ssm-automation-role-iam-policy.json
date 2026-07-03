@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSageMakerTrainingJobDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListTrainingJobs",
+        "sagemaker:ListTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSageMakerTrainingJobStop",
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:StopTrainingJob",
+        "sagemaker:DescribeTrainingJob"
+      ],
+      "Resource": "arn:aws:sagemaker:<YOUR REGION>:<YOUR AWS ACCOUNT>:training-job/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    }
+  ]
+}

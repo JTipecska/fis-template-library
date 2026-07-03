@@ -1,0 +1,30 @@
+{
+  "description": "Stop running SageMaker processing jobs tagged FIS-Ready=True to simulate processing job interruption",
+  "targets": {},
+  "actions": {
+    "stopSageMakerProcessingJobs": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Discover and stop running SageMaker processing jobs with the specified tag",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-stop-processing-job-automation",
+        "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"duration\":\"PT10M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "StopSageMakerProcessingJob",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "fail"
+  }
+}

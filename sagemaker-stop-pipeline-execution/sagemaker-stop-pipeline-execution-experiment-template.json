@@ -1,0 +1,30 @@
+{
+  "description": "Stop running SageMaker pipeline executions for pipelines tagged FIS-Ready=True to simulate pipeline interruption",
+  "targets": {},
+  "actions": {
+    "stopSageMakerPipelineExecutions": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Discover and stop running SageMaker pipeline executions for tagged pipelines",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-stop-pipeline-execution-automation",
+        "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"duration\":\"PT10M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "StopSageMakerPipelineExecution",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "fail"
+  }
+}

@@ -1,0 +1,155 @@
+description: "Discover and stop running SageMaker processing jobs with a specific tag to simulate processing job interruption"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify SageMaker processing jobs to stop"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify SageMaker processing jobs to stop"
+    default: "True"
+  duration:
+    type: String
+    description: "Observation window duration in ISO8601 format after jobs are stopped"
+    default: "PT10M"
+  region:
+    type: String
+    description: "AWS Region of the SageMaker processing jobs"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: discoverProcessingJobs
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: discover_processing_jobs
+      Script: |
+        import boto3
+
+        def discover_processing_jobs(events, context):
+            region = events['region']
+            tag_key = events['tagKey']
+            tag_value = events['tagValue']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            target_jobs = []
+
+            paginator = sm.get_paginator('list_processing_jobs')
+            for page in paginator.paginate(StatusEquals='InProgress'):
+                for job in page.get('ProcessingJobSummaries', []):
+                    job_name = job['ProcessingJobName']
+                    job_arn = job['ProcessingJobArn']
+                    try:
+                        tags_response = sm.list_tags(ResourceArn=job_arn)
+                        tags = {t['Key']: t['Value'] for t in tags_response.get('Tags', [])}
+                        if tags.get(tag_key) == tag_value:
+                            target_jobs.append(job_name)
+                    except Exception as e:
+                        print(f"Error retrieving tags for {job_name}: {str(e)}")
+                        continue
+
+            if not target_jobs:
+                raise RuntimeError(
+                    f"No InProgress SageMaker processing jobs found with tag {tag_key}={tag_value}. "
+                    "Ensure at least one processing job is running and tagged before starting the experiment."
+                )
+
+            print(f"Discovered {len(target_jobs)} target processing job(s): {target_jobs}")
+            return target_jobs
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetJobs
+        Selector: $.Payload
+        Type: StringList
+    description: "Find all InProgress SageMaker processing jobs with the specified tag"
+
+  - name: stopProcessingJobs
+    action: aws:executeScript
+    onFailure: "step:verifyJobsStopped"
+    onCancel: "step:verifyJobsStopped"
+    inputs:
+      Runtime: python3.11
+      Handler: stop_processing_jobs
+      Script: |
+        import boto3
+
+        def stop_processing_jobs(events, context):
+            region = events['region']
+            target_jobs = events['targetJobs']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            stopped = []
+
+            for job_name in target_jobs:
+                try:
+                    sm.stop_processing_job(ProcessingJobName=job_name)
+                    stopped.append(job_name)
+                    print(f"Stop request sent for processing job: {job_name}")
+                except sm.exceptions.ResourceNotFound:
+                    print(f"Processing job {job_name} not found — may have already completed")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to stop processing job {job_name}: {e}") from e
+
+            print(f"Stop requested for {len(stopped)} job(s): {stopped}")
+            return stopped
+      InputPayload:
+        region: "{{ region }}"
+        targetJobs: "{{ discoverProcessingJobs.targetJobs }}"
+    outputs:
+      - Name: stoppedJobs
+        Selector: $.Payload
+        Type: StringList
+    description: "Send stop request to all discovered processing jobs"
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:verifyJobsStopped"
+    onCancel: "step:verifyJobsStopped"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Observation window — wait for downstream systems to react to the processing job interruption"
+
+  - name: verifyJobsStopped
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: verify_jobs_stopped
+      Script: |
+        import boto3
+
+        def verify_jobs_stopped(events, context):
+            region = events['region']
+            stopped_jobs = events['stoppedJobs']
+
+            sm = boto3.client('sagemaker', region_name=region)
+            results = []
+
+            for job_name in stopped_jobs:
+                try:
+                    response = sm.describe_processing_job(ProcessingJobName=job_name)
+                    status = response['ProcessingJobStatus']
+                    results.append(f"{job_name}: {status}")
+                    print(f"Processing job {job_name} final status: {status}")
+                except Exception as e:
+                    results.append(f"{job_name}: error retrieving status — {str(e)}")
+                    print(f"Could not retrieve status for {job_name}: {str(e)}")
+
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        stoppedJobs: "{{ stopProcessingJobs.stoppedJobs }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Verify final status of all stopped processing jobs and log results"
+    isEnd: true

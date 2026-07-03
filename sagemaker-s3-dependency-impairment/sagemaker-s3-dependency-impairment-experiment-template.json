@@ -1,0 +1,30 @@
+{
+  "description": "Deny S3 access on buckets tagged FIS-Ready=True to simulate S3 dependency unavailability during SageMaker pipeline or job execution",
+  "targets": {},
+  "actions": {
+    "impairS3Dependencies": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Apply a deny policy to tagged S3 buckets for the specified duration, then restore access",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-s3-dependency-impairment-automation",
+        "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"duration\":\"PT10M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "SageMakerS3DependencyImpairment",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}
