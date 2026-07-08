@@ -11,17 +11,10 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowS3GetBucketPolicy",
+      "Sid": "AllowS3BucketPolicyManagement",
       "Effect": "Allow",
       "Action": [
-        "s3:GetBucketPolicy"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Sid": "AllowS3ModifyBucketPolicy",
-      "Effect": "Allow",
-      "Action": [
+        "s3:GetBucketPolicy",
         "s3:PutBucketPolicy",
         "s3:DeleteBucketPolicy"
       ],

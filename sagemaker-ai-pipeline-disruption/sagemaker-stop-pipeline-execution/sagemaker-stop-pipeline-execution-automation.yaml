@@ -105,7 +105,7 @@ mainSteps:
                 except sm.exceptions.ResourceNotFound:
                     print(f"Pipeline execution {execution_arn} not found — may have already completed")
                 except Exception as e:
-                    raise RuntimeError(f"Failed to stop pipeline execution {execution_arn}: {e}") from e
+                    print(f"Failed to stop pipeline execution {execution_arn}: {e}")
 
             print(f"Stop requested for {len(stopped)} execution(s)")
             return stopped
@@ -155,6 +155,7 @@ mainSteps:
       InputPayload:
         region: "{{ region }}"
         stoppedExecutions: "{{ stopPipelineExecutions.stoppedExecutions }}"
+        targetExecutions: "{{ discoverPipelineExecutions.targetExecutions }}"
     outputs:
       - Name: results
         Selector: $.Payload

@@ -2,7 +2,7 @@
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
-THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Hypothesis
 
@@ -23,7 +23,7 @@ Before running this experiment, ensure that:
 
 1. You have the IAM roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided in this directory.
 2. You have created the SSM Automation Document from the sample provided (`sagemaker-stop-pipeline-execution-automation.yaml`).
-3. You have created the FIS Experiment Template from the sample provided (`sagemaker-stop-pipeline-execution-experiment-template.json`).
+3. You have created the FIS Experiment Template from the sample provided (`sagemaker-stop-pipeline-execution-template.json`).
 4. At least one SageMaker pipeline execution is actively running (`Executing` status) at the time the experiment is started.
 5. The SageMaker pipeline(s) whose executions you want to target have the `FIS-Ready=True` tag applied to the **pipeline** (not the execution — pipeline executions do not have tags directly).
 6. You have appropriate monitoring and observability in place (e.g., CloudWatch alarms, PagerDuty integration) to track the impact of the experiment.
@@ -68,8 +68,8 @@ As you adapt this scenario to your needs, we recommend:
 
 1. Reviewing the tag names you use to ensure they fit your specific use case.
 2. Identifying business metrics tied to your pipeline, such as execution success rates or downstream data freshness.
-3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor SageMaker pipeline execution failures (e.g., `ExecutionsFailed` in the SageMaker Pipeline namespace).
-4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+3. Creating an Amazon EventBridge rule on `SageMaker Model Building Pipeline Execution Status Change` events filtering for `currentPipelineExecutionStatus: ["Stopped", "Failed"]` to reliably detect both outcomes — the CloudWatch `ExecutionsFailed` metric only fires for `Failed` status and will not trigger when this experiment stops an execution.
+4. Adding a stop condition tied to a CloudWatch alarm to automatically halt the experiment if critical thresholds are breached.
 5. Verifying that downstream time-based jobs correctly detect missing pipeline output and raise an alert rather than running against stale data.
 6. Documenting the observed RTO — from the time the pipeline stops to the time it successfully completes a re-run — and comparing it against your target.
 7. Documenting the findings from your experiment and updating your incident response runbooks accordingly.
@@ -82,7 +82,7 @@ The following considerations were identified through end-to-end testing of this 
 
 Pipeline executions cannot be tagged directly. The `FIS-Ready=True` tag must be applied to the **pipeline resource itself**. The SSM automation lists pipelines by tag and then queries each pipeline's active executions — it does not filter executions by tag.
 
-### IAM — `s3:StopPipelineExecution` resource ARN format
+### IAM — `sagemaker:StopPipelineExecution` resource ARN format
 
 The SSM automation role requires `sagemaker:StopPipelineExecution` and `sagemaker:DescribePipelineExecution` on execution ARNs (`arn:aws:sagemaker:<region>:<account>:pipeline/*/execution/*`), and `sagemaker:ListPipelines`, `sagemaker:ListPipelineExecutions`, and `sagemaker:ListTags` on `*`. These cannot be scoped by tag condition because the list/tag operations require a wildcard resource.
 

@@ -97,7 +97,7 @@ mainSteps:
                 except sm.exceptions.ResourceNotFound:
                     print(f"Transform job {job_name} not found — may have already completed")
                 except Exception as e:
-                    raise RuntimeError(f"Failed to stop transform job {job_name}: {e}") from e
+                    print(f"Failed to stop transform job {job_name}: {e}")
 
             print(f"Stop requested for {len(stopped)} job(s): {stopped}")
             return stopped
@@ -147,6 +147,7 @@ mainSteps:
       InputPayload:
         region: "{{ region }}"
         stoppedJobs: "{{ stopTransformJobs.stoppedJobs }}"
+        targetJobs: "{{ discoverTransformJobs.targetJobs }}"
     outputs:
       - Name: results
         Selector: $.Payload

@@ -30,7 +30,12 @@
       "Sid": "AllowPassRole",
       "Effect": "Allow",
       "Action": ["iam:PassRole"],
-      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"]
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ssm.amazonaws.com"
+        }
+      }
     }
   ]
 }
