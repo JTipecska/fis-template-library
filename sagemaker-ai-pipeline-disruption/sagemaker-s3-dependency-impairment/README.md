@@ -4,7 +4,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## Example Hypothesis
+## Hypothesis
 
 When the S3 buckets used by a SageMaker pipeline become unavailable mid-execution, a CloudWatch alarm should fire within 5 minutes and the on-call team notified. The pipeline should fail gracefully with a clear error rather than hanging indefinitely. Once S3 access is restored, the platform should be able to re-run the pipeline successfully within the defined RTO.
 

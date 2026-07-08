@@ -8,7 +8,7 @@
       "parameters": {
         "maxDuration": "PT1H",
         "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-s3-dependency-impairment-automation",
-        "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"duration\":\"PT10M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+        "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"duration\":\"PT10M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
       },
       "targets": {}
     }
@@ -18,7 +18,7 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
   "tags": {
     "Name": "SageMakerS3DependencyImpairment",
     "Purpose": "resilience-testing"

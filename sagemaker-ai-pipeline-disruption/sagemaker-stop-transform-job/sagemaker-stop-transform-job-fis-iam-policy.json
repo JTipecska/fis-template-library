@@ -30,7 +30,7 @@
       "Sid": "AllowPassRole",
       "Effect": "Allow",
       "Action": ["iam:PassRole"],
-      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE>"]
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"]
     }
   ]
 }

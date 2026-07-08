@@ -21,8 +21,8 @@
         "ssm:StopAutomationExecution"
       ],
       "Resource": [
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-stop-pipeline-execution-automation",
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/sagemaker-stop-pipeline-execution-automation:*",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sagemaker-stop-training-job-automation",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/sagemaker-stop-training-job-automation:*",
         "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
       ]
     },
@@ -30,7 +30,7 @@
       "Sid": "AllowPassRole",
       "Effect": "Allow",
       "Action": ["iam:PassRole"],
-      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE>"]
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"]
     }
   ]
 }

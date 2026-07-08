@@ -4,7 +4,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## Example Hypothesis
+## Hypothesis
 
 When a SageMaker processing job is stopped mid-run, a CloudWatch alarm should fire within 5 minutes and the on-call team notified. Any SageMaker pipeline containing this processing step should surface the failure and not continue to subsequent steps. The platform should be able to recover and re-run the failed job or pipeline within the defined RTO.
 
