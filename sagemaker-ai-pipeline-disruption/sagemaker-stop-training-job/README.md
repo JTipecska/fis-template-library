@@ -73,6 +73,26 @@ As you adapt this scenario to your needs, we recommend:
 6. Documenting the observed RTO — from the time the training job stops to the time a replacement model is available — and comparing it against your target.
 7. Documenting the findings from your experiment and updating your incident response runbooks accordingly.
 
+## Deployment Notes
+
+The following considerations were identified through end-to-end testing of this experiment and should be accounted for before running it.
+
+### Tagging — tag the job resource directly
+
+The `FIS-Ready=True` tag must be on the training job itself. If the job is a step within a SageMaker Pipeline, tags defined in the pipeline definition's `TrainingStep` arguments are propagated to the underlying job resource and will be picked up correctly.
+
+### IAM — tag condition is supported for training jobs
+
+`sagemaker:StopTrainingJob` and `sagemaker:DescribeTrainingJob` correctly evaluate `aws:ResourceTag` conditions in IAM identity policies. You can scope these actions to `aws:ResourceTag/FIS-Ready: True` safely.
+
+### Training script packaging — `sagemaker_submit_directory`
+
+When using the `sagemaker_submit_directory` hyperparameter to supply a training script, the value must point to a `sourcedir.tar.gz` archive in S3 (e.g. `s3://my-bucket/code/training/sourcedir.tar.gz`), not a directory prefix. If you store processing and training scripts in the same S3 prefix without subdirectories, CDK's `BucketDeployment` with default `prune=True` will overwrite files — use separate S3 prefixes (`code/processing/` and `code/training/`) to avoid this.
+
+### Test environment
+
+A complete CDK-based test environment for all five experiments in this group — including IAM roles, SageMaker pipeline, SSM documents, and FIS templates — is available at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments). It includes a runner script (`scripts/run_all_experiments.py`) that exercises all five experiments consecutively and captures per-experiment results.
+
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).

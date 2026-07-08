@@ -71,6 +71,53 @@ As you adapt this scenario to your needs, we recommend:
 6. Testing that your SageMaker jobs surface a clear error within a reasonable time when S3 becomes inaccessible, rather than hanging or timing out silently.
 7. Documenting the findings from your experiment and updating your incident response runbooks accordingly.
 
+## Deployment Notes
+
+The following considerations were identified through end-to-end testing of this experiment and should be accounted for before running it.
+
+### IAM — S3 bucket policy operations do not support `aws:ResourceTag` conditions
+
+`s3:PutBucketPolicy` and `s3:DeleteBucketPolicy` are S3 control-plane operations that do not populate `aws:ResourceTag` context keys in IAM policy evaluation. A tag condition on these actions will always result in `AccessDenied`, regardless of whether the bucket is tagged. **Do not use tag conditions on these actions.** Instead, scope them to explicit bucket ARNs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:PutBucketPolicy", "s3:DeleteBucketPolicy"],
+  "Resource": [
+    "arn:aws:s3:::my-input-bucket",
+    "arn:aws:s3:::my-output-bucket"
+  ]
+}
+```
+
+Similarly, `s3:GetBucketPolicy` must be unconditional — it is evaluated before the current bucket policy can be read, so a tag condition will also deny it.
+
+### IAM — `s3:GetBucketTagging` is required for discovery
+
+The discovery step calls `s3:GetBucketTagging` to filter buckets by the `FIS-Ready=True` tag. This action requires `"Resource": "*"` as S3 does not support resource-level permissions for tagging reads.
+
+### Timing — deny policy applies 30–90 seconds after FIS fires
+
+The SSM automation runs a discovery step before applying the deny policy. Expect 30–90 seconds between the FIS experiment starting and S3 returning `AccessDenied`. If you are observing the impairment programmatically, poll in a loop rather than using a single fixed-delay check — a single probe taken at 15 seconds will typically fire before the policy is applied.
+
+### Scope — the deny blocks all principals, including your own IAM identity
+
+The `FISTemporaryDeny` bucket policy statement uses `"Principal": "*"`, which blocks all IAM principals including your own user or role. Do not attempt to access targeted buckets from the console or CLI during the impairment window.
+
+### Restore — always runs even on failure or cancellation
+
+The `removeDenyPolicy` step is wired as the `onFailure` and `onCancel` target for both the apply and wait steps. If the experiment is cancelled mid-run or the apply step fails for any reason, the restore step still executes. Verify the bucket policy was fully cleaned up after the experiment:
+
+```bash
+aws s3api get-bucket-policy --bucket <YOUR BUCKET NAME> --region <YOUR REGION>
+```
+
+The response should contain no `FISTemporaryDeny` statement. If the bucket had no policy before the experiment, the policy should be absent entirely.
+
+### Test environment
+
+A complete CDK-based test environment for all five experiments in this group — including IAM roles, SageMaker pipeline, SSM documents, and FIS templates — is available at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments). It includes a runner script (`scripts/run_all_experiments.py`) that exercises all five experiments consecutively and captures per-experiment results.
+
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).

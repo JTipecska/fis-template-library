@@ -30,6 +30,17 @@ See [`sagemaker-ai-pipeline-disruption/README.md`](sagemaker-ai-pipeline-disrupt
 | [`sagemaker-stop-training-job`](sagemaker-ai-pipeline-disruption/sagemaker-stop-training-job/) | Stops `InProgress` SageMaker training jobs | No | Baseline pattern — all other job-stop experiments follow this same discovery → stop → observe → verify sequence |
 | [`sagemaker-s3-dependency-impairment`](sagemaker-ai-pipeline-disruption/sagemaker-s3-dependency-impairment/) | Denies `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject` on tagged S3 buckets | **Yes** | Injects a `FISTemporaryDeny` bucket policy statement and always removes it via `onFailure`/`onCancel` handlers; uses `emptyTargetResolutionMode: skip` to prevent failure when no tagged buckets exist |
 
+### Validated deployment notes
+
+The following cross-cutting issues were identified through end-to-end testing of all five experiments and are documented in each experiment's `README.md`:
+
+- **Tag placement differs by experiment**: pipeline executions cannot be tagged — the `FIS-Ready=True` tag must be on the pipeline resource for Experiment 1. For job-stop experiments (2–4), the tag goes on the job resource. For S3 impairment (5), the tag goes on the S3 buckets.
+- **S3 IAM limitation**: `aws:ResourceTag` conditions do not work for `s3:PutBucketPolicy` or `s3:DeleteBucketPolicy`. Scope these actions to explicit bucket ARNs rather than tag conditions. This is documented in detail in the `sagemaker-s3-dependency-impairment` README.
+- **CloudWatch `ExecutionsFailed` does not fire for `Stopped` pipelines**: use an EventBridge rule on `SageMaker Model Building Pipeline Execution Status Change` to reliably detect both `Stopped` and `Failed` outcomes.
+- **SSM automation latency**: the S3 impairment automation takes 30–90 seconds to apply the deny policy after FIS fires. Validate impairment with a polling loop, not a single fixed-delay check.
+
+A complete CDK test environment (IAM, SageMaker pipeline, SSM documents, FIS templates, runner script) that exercises all five experiments end-to-end is at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments).
+
 ### Notable differences from the training-job pattern
 
 The `sagemaker-stop-training-job` experiment is the baseline. The other experiments diverge from it in the following ways:

@@ -74,6 +74,33 @@ As you adapt this scenario to your needs, we recommend:
 6. Documenting the observed RTO — from the time the processing job stops to the time it successfully completes a re-run — and comparing it against your target.
 7. Documenting the findings from your experiment and updating your incident response runbooks accordingly.
 
+## Deployment Notes
+
+The following considerations were identified through end-to-end testing of this experiment and should be accounted for before running it.
+
+### Tagging — tag the job resource directly
+
+The `FIS-Ready=True` tag must be on the processing job itself. If the job is a step within a SageMaker Pipeline, tags defined in the pipeline definition's `ProcessingStep` arguments are propagated to the underlying job resource and will be picked up correctly.
+
+### Container entrypoint — do not rely on image default
+
+The SSM automation stops the processing job regardless of what the container is doing, but the job must reach `InProgress` status first. If you are using a training-optimised image (e.g., the SageMaker scikit-learn DLC) for a processing job, the image's default `ENTRYPOINT` is typically `train`, which will fail immediately on a processing job and cause it to transition to `Failed` before FIS can stop it. Always set `ContainerEntrypoint` explicitly in `AppSpecification` to point to your processing script:
+
+```json
+"AppSpecification": {
+  "ImageUri": "<your-image>",
+  "ContainerEntrypoint": ["python3", "/opt/ml/processing/input/code/your_script.py"]
+}
+```
+
+### IAM — tag condition is supported for processing jobs
+
+Unlike S3 bucket policy operations, `sagemaker:StopProcessingJob` and `sagemaker:DescribeProcessingJob` correctly evaluate `aws:ResourceTag` conditions in IAM identity policies. You can scope these actions to `aws:ResourceTag/FIS-Ready: True` safely.
+
+### Test environment
+
+A complete CDK-based test environment for all five experiments in this group — including IAM roles, SageMaker pipeline, SSM documents, and FIS templates — is available at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments). It includes a runner script (`scripts/run_all_experiments.py`) that exercises all five experiments consecutively and captures per-experiment results.
+
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).

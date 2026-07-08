@@ -149,6 +149,36 @@ Before running any of these experiments, ensure that:
 6. You have verified the downstream system's scheduled trigger time so you can observe the alert behavior at the expected failure detection window.
 7. An incident response runbook exists for restoring the pipeline and re-running it within the RTO.
 
+## Validated Test Environment
+
+A CDK-based test environment that deploys a full SageMaker batch inference pipeline and exercises all five experiments end-to-end is available at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments). It includes:
+
+- `stacks/infra_stack.py` — S3 buckets (tagged `FIS-Ready=True`), IAM roles for FIS and SSM Automation, CloudWatch alarms, SNS topic
+- `stacks/pipeline_stack.py` — SageMaker pipeline (Processing → Training → Transform steps), SSM Automation documents, FIS experiment templates, EventBridge rule for `Stopped` + `Failed` pipeline execution alerts
+- `scripts/run_all_experiments.py` — runner script that starts a pipeline execution, fires each FIS experiment consecutively, and captures per-experiment results
+
+The following cross-cutting deployment lessons were validated through test runs against this environment:
+
+### Tag placement — pipeline vs. execution vs. job
+
+All five experiments use `FIS-Ready=True` as the target filter, but the tag must be applied to different resource types:
+
+- **Experiments 2–4** (processing/training/transform): tag goes on the **job resource itself**. Tags defined in a SageMaker Pipeline step are propagated automatically to the underlying job.
+- **Experiment 1** (pipeline execution stop): pipeline executions cannot be tagged. The tag must be on the **pipeline resource**. The SSM automation lists tagged pipelines, then queries their active executions.
+- **Experiment 5** (S3 impairment): tag goes on the **S3 buckets** used as input/output.
+
+### S3 IAM — `aws:ResourceTag` does not work for bucket policy operations
+
+`s3:PutBucketPolicy` and `s3:DeleteBucketPolicy` do not populate `aws:ResourceTag` context keys during IAM evaluation. A tag-based condition on these actions always results in `AccessDenied`. Similarly, `s3:GetBucketPolicy` must be unconditional. See the individual README for Experiment 5 for the correct IAM pattern.
+
+### Observability — use EventBridge for pipeline `Stopped` status
+
+The CloudWatch `ExecutionsFailed` metric only fires when a pipeline execution reaches `Failed` status. Experiments that cause a `Stopped` transition (Experiment 1, and indirectly Experiments 2–4 when a job failure causes the parent pipeline to stop) will not trigger a metric alarm. Use an EventBridge rule on `SageMaker Model Building Pipeline Execution Status Change` filtering for `currentPipelineExecutionStatus: ["Stopped", "Failed"]` to cover both cases.
+
+### SSM automation startup latency for S3 impairment
+
+For Experiment 5, the SSM automation runs a discovery step before applying the deny policy. Expect 30–90 seconds between FIS firing and S3 returning `AccessDenied`. Any validation logic should poll with retries rather than using a single fixed-delay check.
+
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the targeted stop/deny action has completed. For production testing, attach a CloudWatch alarm stop condition before proceeding.

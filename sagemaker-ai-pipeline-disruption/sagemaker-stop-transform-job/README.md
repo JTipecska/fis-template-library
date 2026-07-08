@@ -74,6 +74,30 @@ As you adapt this scenario to your needs, we recommend:
 6. Documenting the observed RTO — from the time the transform job stops to the time it successfully completes a re-run — and comparing it against your target.
 7. Documenting the findings from your experiment and updating your incident response runbooks accordingly.
 
+## Deployment Notes
+
+The following considerations were identified through end-to-end testing of this experiment and should be accounted for before running it.
+
+### Tagging — tag the job resource directly
+
+The `FIS-Ready=True` tag must be on the transform job itself. If the job is a step within a SageMaker Pipeline, tags defined in the pipeline definition's `TransformStep` arguments are propagated to the underlying job resource and will be picked up correctly.
+
+### IAM — tag condition is supported for transform jobs
+
+`sagemaker:StopTransformJob` and `sagemaker:DescribeTransformJob` correctly evaluate `aws:ResourceTag` conditions in IAM identity policies. You can scope these actions to `aws:ResourceTag/FIS-Ready: True` safely.
+
+### Timing — SSM automation duration
+
+The SSM automation for this experiment includes a 10-minute observation window after stopping the job, meaning the total FIS experiment duration is typically 11–18 minutes from start to completion. Ensure any polling loop or wait mechanism used to observe the experiment outcome has a timeout of at least 20 minutes. The FIS experiment template sets `maxDuration: PT1H` on the action to accommodate this.
+
+### SageMaker Model requirement
+
+A SageMaker batch transform job requires a registered SageMaker Model to exist before it can be created. The model does not need to be functional for the purpose of this experiment (the job will be stopped before inference completes), but the model resource and its container image must be accessible at job creation time.
+
+### Test environment
+
+A complete CDK-based test environment for all five experiments in this group — including IAM roles, SageMaker pipeline, SSM documents, and FIS templates — is available at [`fis-ssm-ai-pipleine-experiments`](https://gitlab.aws.dev/jenntip/fis-ssm-ai-pipleine-experiments). It includes a runner script (`scripts/run_all_experiments.py`) that exercises all five experiments consecutively and captures per-experiment results.
+
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
