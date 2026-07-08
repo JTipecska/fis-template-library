@@ -11,19 +11,24 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowS3PolicyManagement",
+      "Sid": "AllowS3GetBucketPolicy",
       "Effect": "Allow",
       "Action": [
-        "s3:GetBucketPolicy",
+        "s3:GetBucketPolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowS3ModifyBucketPolicy",
+      "Effect": "Allow",
+      "Action": [
         "s3:PutBucketPolicy",
         "s3:DeleteBucketPolicy"
       ],
-      "Resource": "arn:aws:s3:::*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/FIS-Ready": "True"
-        }
-      }
+      "Resource": [
+        "arn:aws:s3:::<YOUR INPUT BUCKET NAME>",
+        "arn:aws:s3:::<YOUR OUTPUT BUCKET NAME>"
+      ]
     }
   ]
 }
