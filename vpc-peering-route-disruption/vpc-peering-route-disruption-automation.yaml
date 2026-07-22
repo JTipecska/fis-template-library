@@ -1,0 +1,316 @@
+description: "Disrupt VPC peering connectivity by removing route table entries targeting the peer VPC CIDR. Routes are automatically restored after the specified duration. Designed for use with AWS FIS via aws:ssm:start-automation-execution."
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  PeerVpcCidr:
+    type: String
+    description: "CIDR block of the peer VPC (e.g., 10.1.0.0/16)"
+    allowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  RouteTableIds:
+    type: StringList
+    description: "Route table IDs to modify (must be tagged FIS-Ready=True)"
+  VpcPeeringConnectionId:
+    type: String
+    description: "VPC peering connection ID (pcx-xxx) used for route restoration"
+    allowedPattern: "^pcx-[a-z0-9]+$"
+  duration:
+    type: String
+    description: "Duration of the impairment in ISO8601 format"
+    default: "PT5M"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role ARN for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: validatePrerequisites
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Validate that route tables exist, contain routes to the peer VPC CIDR, and the peering connection is active"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        PeerVpcCidr: "{{ PeerVpcCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+        VpcPeeringConnectionId: "{{ VpcPeeringConnectionId }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            peer_cidr = event['PeerVpcCidr']
+            rtb_ids = event['RouteTableIds']
+            pcx_id = event['VpcPeeringConnectionId']
+
+            log(f"Validating prerequisites")
+            log(f"Peer VPC CIDR: {peer_cidr}")
+            log(f"Route Table IDs: {rtb_ids}")
+            log(f"Peering Connection: {pcx_id}")
+
+            pcx_resp = ec2.describe_vpc_peering_connections(
+                VpcPeeringConnectionIds=[pcx_id]
+            )
+            if not pcx_resp['VpcPeeringConnections']:
+                raise Exception(f"Peering connection {pcx_id} not found")
+            status = pcx_resp['VpcPeeringConnections'][0]['Status']['Code']
+            if status != 'active':
+                raise Exception(f"Peering connection {pcx_id} is not active (status: {status})")
+            log(f"Peering connection {pcx_id} is active")
+
+            rtb_resp = ec2.describe_route_tables(RouteTableIds=rtb_ids)
+            if len(rtb_resp['RouteTables']) != len(rtb_ids):
+                found = [rt['RouteTableId'] for rt in rtb_resp['RouteTables']]
+                missing = set(rtb_ids) - set(found)
+                raise Exception(f"Route tables not found: {missing}")
+
+            for rt in rtb_resp['RouteTables']:
+                rtb_id = rt['RouteTableId']
+                route_found = any(
+                    r.get('DestinationCidrBlock') == peer_cidr
+                    for r in rt['Routes']
+                )
+                if not route_found:
+                    raise Exception(f"No route to {peer_cidr} found in {rtb_id}")
+                log(f"Route to {peer_cidr} confirmed in {rtb_id}")
+
+            log("All prerequisites validated successfully")
+            return {'status': 'validated'}
+    outputs:
+      - Name: validationStatus
+        Selector: $.Payload.status
+        Type: String
+
+  - name: captureOriginalState
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Record current route configurations for rollback"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        PeerVpcCidr: "{{ PeerVpcCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            peer_cidr = event['PeerVpcCidr']
+            rtb_ids = event['RouteTableIds']
+
+            log("Capturing original route state for rollback")
+            original_routes = []
+
+            rtb_resp = ec2.describe_route_tables(RouteTableIds=rtb_ids)
+            for rt in rtb_resp['RouteTables']:
+                rtb_id = rt['RouteTableId']
+                for route in rt['Routes']:
+                    if route.get('DestinationCidrBlock') == peer_cidr:
+                        entry = {
+                            'RouteTableId': rtb_id,
+                            'DestinationCidrBlock': peer_cidr,
+                            'VpcPeeringConnectionId': route.get('VpcPeeringConnectionId', '')
+                        }
+                        original_routes.append(entry)
+                        log(f"Captured: {rtb_id} -> {peer_cidr} via {entry['VpcPeeringConnectionId']}")
+
+            if not original_routes:
+                raise Exception("No routes captured - nothing to disrupt")
+
+            log(f"Captured {len(original_routes)} routes for rollback")
+            return {'originalRoutes': json.dumps(original_routes)}
+    outputs:
+      - Name: originalRoutes
+        Selector: $.Payload.originalRoutes
+        Type: String
+
+  - name: deletePeeringRoutes
+    action: aws:executeScript
+    onFailure: "step:restoreRoutes"
+    onCancel: "step:restoreRoutes"
+    timeoutSeconds: 120
+    description: "Remove routes to the peer VPC CIDR from specified route tables"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        PeerVpcCidr: "{{ PeerVpcCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            peer_cidr = event['PeerVpcCidr']
+            rtb_ids = event['RouteTableIds']
+
+            log(f"INJECTING FAULT: Deleting routes to {peer_cidr}")
+            deleted = []
+            errors = []
+
+            for rtb_id in rtb_ids:
+                try:
+                    rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                    route_exists = any(
+                        r.get('DestinationCidrBlock') == peer_cidr
+                        for r in rtb_resp['RouteTables'][0]['Routes']
+                    )
+                    if not route_exists:
+                        log(f"Route to {peer_cidr} already absent in {rtb_id} - skipping")
+                        continue
+
+                    ec2.delete_route(
+                        RouteTableId=rtb_id,
+                        DestinationCidrBlock=peer_cidr
+                    )
+                    deleted.append(rtb_id)
+                    log(f"Deleted route to {peer_cidr} from {rtb_id}")
+                except Exception as e:
+                    errors.append(f"{rtb_id}: {str(e)}")
+                    log(f"ERROR deleting route from {rtb_id}: {e}")
+
+            if errors and not deleted:
+                raise Exception(f"Failed to delete any routes: {errors}")
+
+            log(f"Fault injected: {len(deleted)} routes deleted, {len(errors)} errors")
+            return {'deletedCount': len(deleted), 'errorCount': len(errors)}
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:restoreRoutes"
+    onCancel: "step:restoreRoutes"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Wait for the specified duration while VPC peering routes are disrupted"
+
+  - name: restoreRoutes
+    action: aws:executeScript
+    timeoutSeconds: 120
+    description: "Recreate original routes from captured state"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        OriginalRoutes: "{{ captureOriginalState.originalRoutes }}"
+        VpcPeeringConnectionId: "{{ VpcPeeringConnectionId }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            original_routes = json.loads(event['OriginalRoutes'])
+            pcx_id = event['VpcPeeringConnectionId']
+
+            log(f"RESTORING: Recreating {len(original_routes)} routes")
+            restored = []
+            failures = []
+
+            for route in original_routes:
+                rtb_id = route['RouteTableId']
+                cidr = route['DestinationCidrBlock']
+                route_pcx = route.get('VpcPeeringConnectionId') or pcx_id
+
+                try:
+                    rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                    route_exists = any(
+                        r.get('DestinationCidrBlock') == cidr
+                        for r in rtb_resp['RouteTables'][0]['Routes']
+                    )
+                    if route_exists:
+                        log(f"Route to {cidr} already exists in {rtb_id} - skipping")
+                        restored.append(rtb_id)
+                        continue
+
+                    ec2.create_route(
+                        RouteTableId=rtb_id,
+                        DestinationCidrBlock=cidr,
+                        VpcPeeringConnectionId=route_pcx
+                    )
+                    restored.append(rtb_id)
+                    log(f"Restored route: {rtb_id} -> {cidr} via {route_pcx}")
+                except Exception as e:
+                    failures.append(f"{rtb_id}: {str(e)}")
+                    log(f"ERROR restoring route in {rtb_id}: {e}")
+
+            if failures:
+                raise RuntimeError(
+                    "Cleanup failed for one or more route tables; routes may still be missing: "
+                    + "; ".join(failures)
+                )
+
+            log(f"All {len(restored)} routes restored successfully")
+            return {'restoredCount': len(restored)}
+
+  - name: validateRestoration
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Confirm all routes are restored correctly"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        OriginalRoutes: "{{ captureOriginalState.originalRoutes }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            original_routes = json.loads(event['OriginalRoutes'])
+
+            log("Validating route restoration")
+            all_valid = True
+
+            for route in original_routes:
+                rtb_id = route['RouteTableId']
+                cidr = route['DestinationCidrBlock']
+                pcx_id = route['VpcPeeringConnectionId']
+
+                rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                current_routes = rtb_resp['RouteTables'][0]['Routes']
+
+                found = any(
+                    r.get('DestinationCidrBlock') == cidr and
+                    r.get('VpcPeeringConnectionId') == pcx_id and
+                    r.get('State') == 'active'
+                    for r in current_routes
+                )
+
+                if found:
+                    log(f"VALIDATED: {rtb_id} -> {cidr} via {pcx_id} is active")
+                else:
+                    log(f"FAILED: Route {rtb_id} -> {cidr} via {pcx_id} not restored correctly")
+                    all_valid = False
+
+            if not all_valid:
+                raise Exception("Route restoration validation failed - manual intervention may be required")
+
+            log("All routes validated successfully - experiment complete")
+            return {'validationStatus': 'passed'}
+    isEnd: true

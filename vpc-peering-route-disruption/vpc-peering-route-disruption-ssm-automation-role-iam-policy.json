@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRouteTableDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeVpcPeeringConnections"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowRouteTableModification",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DeleteRoute",
+        "ec2:CreateRoute"
+      ],
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:route-table/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    }
+  ]
+}
