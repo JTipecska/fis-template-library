@@ -51,6 +51,54 @@ watch -n 5 'ping -c 1 -W 2 <PEER VPC RESOURCE IP> && echo "REACHABLE" || echo "U
 
 During the impairment period, you should see "UNREACHABLE" responses.
 
+## Bidirectional disruption for cross-region peering
+
+A single experiment instance removes routes from one side of the peering connection only, creating an **asymmetric failure**. Traffic originating from the non-disrupted side is still routed toward the peer (though TCP connections will fail because return traffic has no path). Stateless protocols (UDP, ICMP) originating from the non-disrupted side can still reach the disrupted VPC.
+
+For a complete bidirectional disruption of cross-region peering, deploy the SSM Automation Document in **both regions** and run one FIS experiment per region simultaneously:
+
+```bash
+# Deploy the SSM document in both regions
+aws ssm create-document --name "FIS-Disrupt-VPC-Peering-Routes" \
+  --document-type Automation --document-format YAML \
+  --content file://vpc-peering-route-disruption-automation.yaml --region <REGION A>
+
+aws ssm create-document --name "FIS-Disrupt-VPC-Peering-Routes" \
+  --document-type Automation --document-format YAML \
+  --content file://vpc-peering-route-disruption-automation.yaml --region <REGION B>
+
+# Start both experiments simultaneously for full bidirectional disruption
+aws fis start-experiment --experiment-template-id <REGION_A_TEMPLATE_ID> --region <REGION A> &
+aws fis start-experiment --experiment-template-id <REGION_B_TEMPLATE_ID> --region <REGION B> &
+wait
+```
+
+Each experiment targets the route table in its own region:
+- **Region A experiment**: deletes the route to the peer VPC CIDR from the local route table
+- **Region B experiment**: deletes the route to the peer VPC CIDR from the local route table
+
+Both experiments manage their own rollback independently — if one fails, the other still restores its routes.
+
+## Indirect paths through Transit Gateway
+
+When VPCs are connected through multiple mechanisms (e.g., VPC peering for cross-region and Transit Gateway for cross-environment connectivity within a region), deleting peering routes alone may not achieve full network isolation. Traffic can potentially traverse an indirect path through the Transit Gateway and adjacent VPCs.
+
+For example, consider two VPCs (VPC-A and VPC-B) connected by peering, where each is also attached to a Transit Gateway that connects to other VPCs:
+
+```
+VPC-A ──TGW──► VPC-C ──Peering──► VPC-D ──TGW──► VPC-B
+```
+
+Deleting the direct VPC-A → VPC-B peering route does **not** block this indirect path. If route tables in the intermediate VPCs allow transitive routing, traffic from VPC-A can still reach VPC-B through VPC-C and VPC-D.
+
+**Implications for isolation testing:**
+
+- This experiment is effective for environments where VPC peering is the **only** path between the target VPCs.
+- If Transit Gateway or other routing mechanisms provide alternative paths, this experiment should be combined with additional controls:
+  - **NACL-based denial** (e.g., FIS `aws:network:disrupt-connectivity`) to block traffic at the subnet level regardless of routing path
+  - **TGW route table manipulation** to remove route propagation that allows indirect transit between the target VPCs
+- Use VPC Flow Logs or VPC Reachability Analyzer to confirm that no indirect paths exist before relying on route deletion alone for isolation.
+
 ## Observability and stop conditions
 
 Stop conditions are based on an AWS CloudWatch alarm tied to an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics, so it does not include stop conditions by default (`"stopConditions": [{ "source": "none" }]`).
