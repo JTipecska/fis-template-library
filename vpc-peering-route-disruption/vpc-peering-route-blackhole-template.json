@@ -1,0 +1,30 @@
+{
+  "description": "Disrupt VPC peering connectivity by replacing route entries with a blackhole ENI, preventing fallthrough to default TGW routes",
+  "targets": {},
+  "actions": {
+    "BlackholeVpcPeeringRoutes": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Replace VPC peering routes with blackhole ENI for a controlled duration then restore them",
+      "parameters": {
+        "maxDuration": "PT30M",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/<AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"TargetCidr\": \"<TARGET VPC CIDR>\", \"RouteTableIds\": [\"<ROUTE TABLE ID 1>\", \"<ROUTE TABLE ID 2>\"], \"VpcPeeringConnectionId\": \"<PEERING CONNECTION ID>\", \"SubnetId\": \"<SUBNET ID>\", \"duration\": \"PT5M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "BlackholeVpcPeeringRoutes",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}

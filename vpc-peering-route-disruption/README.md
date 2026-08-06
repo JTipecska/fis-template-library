@@ -20,13 +20,18 @@ Our application will remain available and resilient when VPC peering connectivit
 
 Before running this experiment, ensure that:
 
-1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided.
-2. You have created the SSM Automation Document from the sample provided (vpc-peering-route-disruption-automation.yaml).
-3. You have created the FIS Experiment Template from the sample provided (vpc-peering-route-disruption-template.json).
+1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided (separate roles for FIS and SSM Automation).
+2. You have created the SSM Automation Document from one of the provided samples:
+   - `vpc-peering-route-disruption-automation.yaml` — Route deletion variant (simple, no TGW fallback)
+   - `vpc-peering-route-blackhole-automation.yaml` — Blackhole variant (prevents TGW fallthrough)
+3. You have created the corresponding FIS Experiment Template:
+   - `vpc-peering-route-disruption-template.json` — For the deletion variant
+   - `vpc-peering-route-blackhole-template.json` — For the blackhole variant
 4. The VPC peering connection is in an `active` state.
 5. The route table(s) you want to target have the `FIS-Ready=True` tag.
 6. The route table(s) contain a route entry for the peer VPC CIDR pointing to the peering connection.
-7. You have appropriate monitoring and observability in place to track the impact of the experiment.
+7. (Blackhole variant only) A subnet exists in the same VPC as the target route tables — needed for temporary ENI creation.
+8. You have appropriate monitoring and observability in place to track the impact of the experiment.
 
 ## How it works
 
@@ -98,6 +103,48 @@ Deleting the direct VPC-A → VPC-B peering route does **not** block this indire
   - **NACL-based denial** (e.g., FIS `aws:network:disrupt-connectivity`) to block traffic at the subnet level regardless of routing path
   - **TGW route table manipulation** to remove route propagation that allows indirect transit between the target VPCs
 - Use VPC Flow Logs or VPC Reachability Analyzer to confirm that no indirect paths exist before relying on route deletion alone for isolation.
+
+## Blackhole variant (prevents TGW fallthrough)
+
+This directory includes a second automation document (`vpc-peering-route-blackhole-automation.yaml`) that addresses the TGW fallback problem. Instead of deleting routes, it **replaces** them with a route pointing to a temporary unattached ENI — creating a blackhole.
+
+### When to use the blackhole variant
+
+Use this variant when:
+- The VPC has a default route (`0.0.0.0/0 → TGW`) or other catch-all route that would carry traffic after a specific route is deleted
+- You need to block traffic to the target CIDR while preserving all other connectivity through the default route (e.g., to production VPCs via the same TGW)
+- NACL-based approaches are not feasible due to large subnet counts or control plane scaling limits
+- The TGW route table is shared across environments, preventing a TGW-level blackhole
+
+### How the blackhole variant works
+
+1. **Create temporary ENI** — An unattached network interface is created in the same VPC. An unattached ENI as a route target causes traffic to be silently dropped (blackhole).
+2. **Replace route atomically** — `ec2:ReplaceRoute` swaps the peering connection target with the ENI target in a single API call. There is no window where the route is absent and traffic could fall through to the default route.
+3. **Wait for duration** — Traffic to the target CIDR is dropped while all other routes (including the default TGW route) continue functioning normally.
+4. **Restore route atomically** — `ec2:ReplaceRoute` swaps back to the original peering connection target.
+5. **Delete temporary ENI** — Cleanup of the temporary resource.
+
+### Comparison of approaches
+
+| Aspect | Route deletion | Blackhole (ENI) |
+|--------|---------------|-----------------|
+| Route during fault | Absent | Present but blackholed |
+| Default route fallthrough | Traffic reaches target via TGW | Traffic is dropped |
+| API operation | DeleteRoute / CreateRoute | ReplaceRoute (atomic swap) |
+| Brief gap in coverage | Yes (between delete and restore) | No (atomic replace) |
+| Temporary resources | None | One ENI (auto-cleaned) |
+| Use when | Peering is the only path | Default/TGW fallback exists |
+
+### Deploying the blackhole variant
+
+```bash
+aws ssm create-document --name "FIS-Blackhole-VPC-Peering-Routes" \
+  --document-type Automation --document-format YAML \
+  --content file://vpc-peering-route-blackhole-automation.yaml \
+  --region <YOUR REGION>
+```
+
+The `SubnetId` parameter must reference a subnet in the same VPC as the targeted route tables. Any subnet will work — the ENI is never attached to an instance.
 
 ## Observability and stop conditions
 

@@ -6,7 +6,9 @@
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeRouteTables",
-        "ec2:DescribeVpcPeeringConnections"
+        "ec2:DescribeVpcPeeringConnections",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeNetworkInterfaces"
       ],
       "Resource": "*"
     },
@@ -15,7 +17,8 @@
       "Effect": "Allow",
       "Action": [
         "ec2:DeleteRoute",
-        "ec2:CreateRoute"
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute"
       ],
       "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:route-table/*",
       "Condition": {
@@ -23,6 +26,16 @@
           "aws:ResourceTag/FIS-Ready": "True"
         }
       }
+    },
+    {
+      "Sid": "AllowTemporaryEniManagement",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
     }
   ]
 }

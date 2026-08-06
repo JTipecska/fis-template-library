@@ -1,0 +1,434 @@
+description: "Disrupt VPC peering connectivity by replacing route table entries with a blackhole (dummy ENI). Unlike route deletion, this prevents traffic from falling through to a default route (e.g., 0.0.0.0/0 via Transit Gateway). Routes are atomically restored after the specified duration."
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  TargetCidr:
+    type: String
+    description: "CIDR block to blackhole (e.g., the peer VPC CIDR 10.1.0.0/16)"
+    allowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  RouteTableIds:
+    type: StringList
+    description: "Route table IDs to modify (must be tagged FIS-Ready=True)"
+  VpcPeeringConnectionId:
+    type: String
+    description: "VPC peering connection ID (pcx-xxx) used for route restoration"
+    allowedPattern: "^pcx-[a-z0-9]+$"
+  SubnetId:
+    type: String
+    description: "Subnet ID in the same VPC to create the temporary blackhole ENI"
+    allowedPattern: "^subnet-[a-z0-9]+$"
+  duration:
+    type: String
+    description: "Duration of the impairment in ISO8601 format"
+    default: "PT5M"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role ARN for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: validatePrerequisites
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Validate that the peering connection is active, route tables contain a route to the target CIDR, and the subnet belongs to the same VPC"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TargetCidr: "{{ TargetCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+        VpcPeeringConnectionId: "{{ VpcPeeringConnectionId }}"
+        SubnetId: "{{ SubnetId }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            target_cidr = event['TargetCidr']
+            rtb_ids = event['RouteTableIds']
+            pcx_id = event['VpcPeeringConnectionId']
+            subnet_id = event['SubnetId']
+
+            log(f"Validating prerequisites for blackhole disruption")
+            log(f"Target CIDR: {target_cidr}")
+            log(f"Route Table IDs: {rtb_ids}")
+            log(f"Peering Connection: {pcx_id}")
+            log(f"Subnet for ENI: {subnet_id}")
+
+            pcx_resp = ec2.describe_vpc_peering_connections(
+                VpcPeeringConnectionIds=[pcx_id]
+            )
+            if not pcx_resp['VpcPeeringConnections']:
+                raise Exception(f"Peering connection {pcx_id} not found")
+            status = pcx_resp['VpcPeeringConnections'][0]['Status']['Code']
+            if status != 'active':
+                raise Exception(f"Peering connection {pcx_id} is not active (status: {status})")
+            log(f"Peering connection {pcx_id} is active")
+
+            rtb_resp = ec2.describe_route_tables(RouteTableIds=rtb_ids)
+            if len(rtb_resp['RouteTables']) != len(rtb_ids):
+                found = [rt['RouteTableId'] for rt in rtb_resp['RouteTables']]
+                missing = set(rtb_ids) - set(found)
+                raise Exception(f"Route tables not found: {missing}")
+
+            rtb_vpc_id = rtb_resp['RouteTables'][0]['VpcId']
+            for rt in rtb_resp['RouteTables']:
+                if rt['VpcId'] != rtb_vpc_id:
+                    raise Exception(f"All route tables must belong to the same VPC")
+                route_found = any(
+                    r.get('DestinationCidrBlock') == target_cidr
+                    for r in rt['Routes']
+                )
+                if not route_found:
+                    raise Exception(f"No route to {target_cidr} found in {rt['RouteTableId']}")
+                log(f"Route to {target_cidr} confirmed in {rt['RouteTableId']}")
+
+            subnet_resp = ec2.describe_subnets(SubnetIds=[subnet_id])
+            if not subnet_resp['Subnets']:
+                raise Exception(f"Subnet {subnet_id} not found")
+            subnet_vpc = subnet_resp['Subnets'][0]['VpcId']
+            if subnet_vpc != rtb_vpc_id:
+                raise Exception(
+                    f"Subnet {subnet_id} is in VPC {subnet_vpc} but route tables are in VPC {rtb_vpc_id}"
+                )
+            log(f"Subnet {subnet_id} confirmed in VPC {rtb_vpc_id}")
+
+            log("All prerequisites validated successfully")
+            return {'status': 'validated', 'vpcId': rtb_vpc_id}
+    outputs:
+      - Name: validationStatus
+        Selector: $.Payload.status
+        Type: String
+
+  - name: createDummyEni
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Create a temporary unattached ENI to serve as the blackhole target"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        SubnetId: "{{ SubnetId }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            subnet_id = event['SubnetId']
+
+            log(f"Creating temporary blackhole ENI in subnet {subnet_id}")
+            resp = ec2.create_network_interface(
+                SubnetId=subnet_id,
+                Description="FIS-temporary-blackhole-eni - do not attach or delete manually",
+                TagSpecifications=[{
+                    'ResourceType': 'network-interface',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': 'fis-blackhole-eni'},
+                        {'Key': 'FIS-Managed', 'Value': 'True'},
+                        {'Key': 'Purpose', 'Value': 'route-blackhole-target'}
+                    ]
+                }]
+            )
+            eni_id = resp['NetworkInterface']['NetworkInterfaceId']
+            log(f"Created ENI: {eni_id}")
+            return {'eniId': eni_id}
+    outputs:
+      - Name: eniId
+        Selector: $.Payload.eniId
+        Type: String
+
+  - name: captureOriginalState
+    action: aws:executeScript
+    onFailure: "step:deleteDummyEni"
+    onCancel: "step:deleteDummyEni"
+    timeoutSeconds: 60
+    description: "Record current route configurations for rollback"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TargetCidr: "{{ TargetCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            target_cidr = event['TargetCidr']
+            rtb_ids = event['RouteTableIds']
+
+            log("Capturing original route state for rollback")
+            original_routes = []
+
+            rtb_resp = ec2.describe_route_tables(RouteTableIds=rtb_ids)
+            for rt in rtb_resp['RouteTables']:
+                rtb_id = rt['RouteTableId']
+                for route in rt['Routes']:
+                    if route.get('DestinationCidrBlock') == target_cidr:
+                        entry = {
+                            'RouteTableId': rtb_id,
+                            'DestinationCidrBlock': target_cidr,
+                            'VpcPeeringConnectionId': route.get('VpcPeeringConnectionId', ''),
+                            'GatewayId': route.get('GatewayId', ''),
+                            'TransitGatewayId': route.get('TransitGatewayId', ''),
+                            'NetworkInterfaceId': route.get('NetworkInterfaceId', '')
+                        }
+                        original_routes.append(entry)
+                        log(f"Captured: {rtb_id} -> {target_cidr} via pcx={entry['VpcPeeringConnectionId']} tgw={entry['TransitGatewayId']}")
+
+            if not original_routes:
+                raise Exception("No routes captured - nothing to disrupt")
+
+            log(f"Captured {len(original_routes)} routes for rollback")
+            return {'originalRoutes': json.dumps(original_routes)}
+    outputs:
+      - Name: originalRoutes
+        Selector: $.Payload.originalRoutes
+        Type: String
+
+  - name: replaceRouteWithBlackhole
+    action: aws:executeScript
+    onFailure: "step:restoreOriginalRoute"
+    onCancel: "step:restoreOriginalRoute"
+    timeoutSeconds: 120
+    description: "Replace routes to target CIDR with blackhole (dummy ENI) in all specified route tables"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TargetCidr: "{{ TargetCidr }}"
+        RouteTableIds: "{{ RouteTableIds }}"
+        EniId: "{{ createDummyEni.eniId }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            target_cidr = event['TargetCidr']
+            rtb_ids = event['RouteTableIds']
+            eni_id = event['EniId']
+
+            log(f"INJECTING FAULT: Replacing routes to {target_cidr} with blackhole ENI {eni_id}")
+            replaced = []
+            errors = []
+
+            for rtb_id in rtb_ids:
+                try:
+                    rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                    current_route = next(
+                        (r for r in rtb_resp['RouteTables'][0]['Routes']
+                         if r.get('DestinationCidrBlock') == target_cidr),
+                        None
+                    )
+                    if current_route and current_route.get('NetworkInterfaceId') == eni_id:
+                        log(f"Route in {rtb_id} already points to blackhole ENI - skipping")
+                        replaced.append(rtb_id)
+                        continue
+
+                    ec2.replace_route(
+                        RouteTableId=rtb_id,
+                        DestinationCidrBlock=target_cidr,
+                        NetworkInterfaceId=eni_id
+                    )
+                    replaced.append(rtb_id)
+                    log(f"Replaced route in {rtb_id}: {target_cidr} -> {eni_id} (blackhole)")
+                except Exception as e:
+                    errors.append(f"{rtb_id}: {str(e)}")
+                    log(f"ERROR replacing route in {rtb_id}: {e}")
+
+            if errors and not replaced:
+                raise Exception(f"Failed to replace any routes: {errors}")
+
+            log(f"Fault injected: {len(replaced)} routes blackholed, {len(errors)} errors")
+            return {'replacedCount': len(replaced), 'errorCount': len(errors)}
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:restoreOriginalRoute"
+    onCancel: "step:restoreOriginalRoute"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Wait for the specified duration while routes are blackholed"
+
+  - name: restoreOriginalRoute
+    action: aws:executeScript
+    onFailure: "step:deleteDummyEni"
+    timeoutSeconds: 120
+    description: "Restore original routes from captured state using atomic replace"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        OriginalRoutes: "{{ captureOriginalState.originalRoutes }}"
+        VpcPeeringConnectionId: "{{ VpcPeeringConnectionId }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            original_routes = json.loads(event['OriginalRoutes'])
+            fallback_pcx = event['VpcPeeringConnectionId']
+
+            log(f"RESTORING: Replacing blackhole with original routes for {len(original_routes)} entries")
+            restored = []
+            failures = []
+
+            for route in original_routes:
+                rtb_id = route['RouteTableId']
+                cidr = route['DestinationCidrBlock']
+                pcx_id = route.get('VpcPeeringConnectionId') or fallback_pcx
+
+                try:
+                    rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                    current_route = next(
+                        (r for r in rtb_resp['RouteTables'][0]['Routes']
+                         if r.get('DestinationCidrBlock') == cidr),
+                        None
+                    )
+                    if current_route and current_route.get('VpcPeeringConnectionId') == pcx_id:
+                        log(f"Route in {rtb_id} already points to {pcx_id} - skipping")
+                        restored.append(rtb_id)
+                        continue
+
+                    ec2.replace_route(
+                        RouteTableId=rtb_id,
+                        DestinationCidrBlock=cidr,
+                        VpcPeeringConnectionId=pcx_id
+                    )
+                    restored.append(rtb_id)
+                    log(f"Restored route: {rtb_id} -> {cidr} via {pcx_id}")
+                except Exception as e:
+                    failures.append(f"{rtb_id}: {str(e)}")
+                    log(f"ERROR restoring route in {rtb_id}: {e}")
+
+            if failures:
+                raise RuntimeError(
+                    "Route restoration failed for one or more tables; blackhole may still be active: "
+                    + "; ".join(failures)
+                )
+
+            log(f"All {len(restored)} routes restored successfully")
+            return {'restoredCount': len(restored)}
+
+  - name: deleteDummyEni
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Delete the temporary blackhole ENI"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        EniId: "{{ createDummyEni.eniId }}"
+      Script: |
+        import boto3
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            eni_id = event['EniId']
+
+            log(f"Cleaning up temporary ENI: {eni_id}")
+            try:
+                ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
+            except ec2.exceptions.ClientError as e:
+                if 'InvalidNetworkInterfaceID.NotFound' in str(e):
+                    log(f"ENI {eni_id} already deleted - skipping")
+                    return {'deleted': False}
+                raise
+
+            ec2.delete_network_interface(NetworkInterfaceId=eni_id)
+            log(f"Deleted ENI: {eni_id}")
+            return {'deleted': True}
+
+  - name: validateRestoration
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 60
+    description: "Confirm all routes are restored and the dummy ENI is cleaned up"
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        OriginalRoutes: "{{ captureOriginalState.originalRoutes }}"
+        EniId: "{{ createDummyEni.eniId }}"
+      Script: |
+        import boto3
+        import json
+        from datetime import datetime, timezone
+
+        def log(msg):
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}")
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            original_routes = json.loads(event['OriginalRoutes'])
+            eni_id = event['EniId']
+
+            log("Validating route restoration and ENI cleanup")
+            all_valid = True
+
+            for route in original_routes:
+                rtb_id = route['RouteTableId']
+                cidr = route['DestinationCidrBlock']
+                pcx_id = route['VpcPeeringConnectionId']
+
+                rtb_resp = ec2.describe_route_tables(RouteTableIds=[rtb_id])
+                current_routes = rtb_resp['RouteTables'][0]['Routes']
+
+                found = any(
+                    r.get('DestinationCidrBlock') == cidr and
+                    r.get('VpcPeeringConnectionId') == pcx_id and
+                    r.get('State') == 'active'
+                    for r in current_routes
+                )
+
+                if found:
+                    log(f"VALIDATED: {rtb_id} -> {cidr} via {pcx_id} is active")
+                else:
+                    log(f"FAILED: Route {rtb_id} -> {cidr} via {pcx_id} not restored correctly")
+                    all_valid = False
+
+            try:
+                ec2.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
+                log(f"FAILED: ENI {eni_id} still exists - cleanup incomplete")
+                all_valid = False
+            except ec2.exceptions.ClientError as e:
+                if 'InvalidNetworkInterfaceID.NotFound' in str(e):
+                    log(f"VALIDATED: ENI {eni_id} successfully deleted")
+                else:
+                    raise
+
+            if not all_valid:
+                raise Exception("Validation failed - manual intervention may be required")
+
+            log("All validations passed - experiment complete")
+            return {'validationStatus': 'passed'}
+    isEnd: true
