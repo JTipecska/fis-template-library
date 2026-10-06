@@ -1,0 +1,89 @@
+description: |-
+  ### Document name - fis-security-lateral-movement
+
+  ## What does this document do?
+  Simulates internal reconnaissance by performing an nmap port scan against a
+  target instance. This mimics the behavior of an internal threat actor or an
+  external actor after initial compromise performing lateral movement discovery.
+  This is considered a lower-severity GuardDuty finding on its own.
+
+  ## Dependencies installed by this SSM Document
+  * nmap (if InstallDependencies is True)
+
+  ## Input Parameters
+  * TargetInstance: Private IP address of the target Linux instance to scan
+  * InstallDependencies: If True, installs nmap (default False — pre-installed by userdata)
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+parameters:
+  TargetInstance:
+    type: String
+    description: 'Target Linux machine IP address for port scan simulation'
+    allowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+  InstallDependencies:
+    type: String
+    description: 'If True, install nmap (default: False — pre-installed by userdata)'
+    default: 'False'
+    allowedValues:
+      - 'True'
+      - 'False'
+mainSteps:
+  - action: aws:runShellScript
+    name: InstallDependencies
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Install nmap if InstallDependencies is True.
+    inputs:
+      onFailure: exit
+      runCommand:
+        - |
+          #!/bin/bash
+          if [[ "{{ InstallDependencies }}" != "True" ]]; then
+            echo "Skipping dependency installation."
+            exit 0
+          fi
+          if which nmap 2>/dev/null; then
+            echo "nmap already installed."
+            exit 0
+          fi
+          echo "Installing nmap..."
+          if [ -f /etc/system-release ] && grep -qi 'Amazon Linux' /etc/system-release; then
+            which amazon-linux-extras 2>/dev/null && sudo amazon-linux-extras install testing -y
+            sudo yum install -y nmap
+          elif grep -qi Ubuntu /etc/issue 2>/dev/null; then
+            sudo apt-get update -y
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nmap
+          else
+            echo "Unsupported OS. Set InstallDependencies to False and pre-install nmap."
+            exit 1
+          fi
+          echo "nmap installed."
+
+  - action: aws:runShellScript
+    name: ExecutePortScan
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Simulate internal recon and attempted lateral movement via port scan.
+    inputs:
+      onFailure: exit
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          echo "Initiating internal port scanning test against {{ TargetInstance }}"
+          sudo nmap -sT "{{ TargetInstance }}"
+          echo "Finished internal port scanning test"

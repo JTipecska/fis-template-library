@@ -11,6 +11,8 @@ Browse the experiment directories to find templates for various fault injection 
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
 - **AI Agents (Amazon Bedrock AgentCore)**: `agentcore-strands-agent-faults/`
+- **Security Detection (Amazon GuardDuty)**: `security-detection-ssh-brute-force/`, `security-detection-rdp-brute-force/`, `security-detection-lateral-movement/`, `security-detection-dns-exfiltration/`, `security-detection-crypto-currency-mining-activity/`
+- **Security Recovery (Ransomware/Backup)**: `security-recovery-ransomware-impact-simulation/`
 
 Each experiment directory contains:
 - Complete FIS experiment template (JSON)

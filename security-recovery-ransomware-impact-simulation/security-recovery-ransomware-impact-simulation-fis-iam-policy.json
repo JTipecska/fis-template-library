@@ -1,0 +1,121 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowFISExperimentControl",
+            "Effect": "Allow",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowSSMSendCommandOnDocuments",
+            "Effect": "Allow",
+            "Action": "ssm:SendCommand",
+            "Resource": [
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-file-encryption",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-health-check"
+            ]
+        },
+        {
+            "Sid": "AllowSSMSendCommandOnInstances",
+            "Effect": "Allow",
+            "Action": "ssm:SendCommand",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowSSMCommandMonitoring",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetCommandInvocation",
+                "ssm:CancelCommand",
+                "ssm:DescribeInstanceInformation",
+                "ssm:ListCommandInvocations"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowSSMAutomationExecution",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:StartAutomationExecution",
+                "ssm:GetAutomationExecution",
+                "ssm:StopAutomationExecution"
+            ],
+            "Resource": [
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-backup-deletion-attempt",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/fis-security-ransomware-backup-deletion-attempt:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-kms-access-revocation",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/fis-security-ransomware-kms-access-revocation:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-rds-isolation",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/fis-security-ransomware-rds-isolation:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+            ]
+        },
+        {
+            "Sid": "AllowPassRoleToSSMAutomation",
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"
+        },
+        {
+            "Sid": "AllowEBSPauseVolumeIO",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:PauseVolumeIO",
+                "ec2:DescribeVolumes"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowNetworkDisruptConnectivity",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkAcl",
+                "ec2:CreateNetworkAclEntry",
+                "ec2:DeleteNetworkAcl",
+                "ec2:DeleteNetworkAclEntry",
+                "ec2:DescribeNetworkAcls",
+                "ec2:ReplaceNetworkAclAssociation",
+                "ec2:DescribeSubnets"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowEC2Describe",
+            "Effect": "Allow",
+            "Action": "ec2:DescribeInstances",
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowCloudWatchLogging",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogDelivery",
+                "logs:PutResourcePolicy",
+                "logs:DescribeResourcePolicies",
+                "logs:DescribeLogGroups"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

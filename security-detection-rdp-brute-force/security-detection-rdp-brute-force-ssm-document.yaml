@@ -1,0 +1,78 @@
+description: |-
+  ### Document name - fis-security-rdp-brute-force
+
+  ## What does this document do?
+  Simulates an RDP brute force attack against a target Windows instance using phony
+  compromised credentials. This is a common technique where threat actors harvest
+  credentials from public repositories. The attempt will not succeed in obtaining
+  access — it is purely a detection test.
+
+  ## Input Parameters
+  * TargetInstance: Private IP address of the target Windows instance
+  * InstallDependencies: If True, installs hydra and its dependencies (default False — pre-installed by userdata)
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+parameters:
+  TargetInstance:
+    type: String
+    description: 'Target Windows machine IP address for RDP brute force simulation'
+    allowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+  InstallDependencies:
+    type: String
+    description: 'If True, install hydra and dependencies (default: False — pre-installed by userdata)'
+    default: 'False'
+    allowedValues:
+      - 'True'
+      - 'False'
+mainSteps:
+  - action: aws:runShellScript
+    name: InstallDependencies
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Install hydra if InstallDependencies is True.
+    inputs:
+      onFailure: exit
+      runCommand:
+        - |
+          #!/bin/bash
+          if [[ "{{ InstallDependencies }}" != "True" ]]; then
+            echo "Skipping dependency installation."
+            exit 0
+          fi
+          echo "Installing dependencies..."
+          sudo amazon-linux-extras install epel -y
+          sudo yum install -y hydra
+          echo "Dependency installation complete."
+
+  - action: aws:runShellScript
+    name: ExecuteRDPBruteForce
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Simulate RDP brute force with compromised credentials against the target instance.
+    inputs:
+      onFailure: exit
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          echo "Initiating RDP brute force test against {{ TargetInstance }}"
+          sudo /home/ec2-user/thc-hydra/hydra \
+            -f \
+            -L /home/ec2-user/users \
+            -P /home/ec2-user/passwords/password_list.txt \
+            "rdp://{{ TargetInstance }}"
+          echo "Finished RDP brute force test"

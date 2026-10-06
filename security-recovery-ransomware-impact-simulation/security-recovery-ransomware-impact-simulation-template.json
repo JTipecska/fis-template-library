@@ -1,0 +1,99 @@
+{
+    "description": "WARNING: This experiment will attempt to delete EBS snapshots and AWS Backup recovery points (if Vault Lock is not configured, backups will be permanently deleted). Multi-phase ransomware impact simulation: (1) file encryption on data volume, (2) EBS I/O pause + S3 network isolation for 75 minutes, (3) backup deletion attempt to validate Vault Lock + KMS decryption revocation with automatic 60-minute hold and built-in restore. KMS key policy is automatically restored at the end of the experiment (or on early stop).",
+    "targets": {
+        "victimInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "Name": "fis-security-blue1"
+            },
+            "selectionMode": "COUNT(1)"
+        },
+        "victimVolumes": {
+            "resourceType": "aws:ec2:ebs-volume",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "Name": "fis-security-blue1-data"
+            },
+            "selectionMode": "COUNT(1)"
+        },
+        "victimSubnets": {
+            "resourceType": "aws:ec2:subnet",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "encrypt-files": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Simulate file encryption on the data volume by renaming .txt files to .enc and dropping a ransom note",
+            "parameters": {
+                "duration": "PT3M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-file-encryption",
+                "documentParameters": "{}"
+            },
+            "targets": {
+                "Instances": "victimInstances"
+            }
+        },
+        "pause-ebs": {
+            "actionId": "aws:ebs:pause-volume-io",
+            "description": "Freeze all I/O on the data EBS volume, simulating encryption-caused storage inaccessibility for the full recovery exercise window",
+            "parameters": {
+                "duration": "PT75M"
+            },
+            "targets": {
+                "Volumes": "victimVolumes"
+            },
+            "startAfter": ["encrypt-files"]
+        },
+        "isolate-s3": {
+            "actionId": "aws:network:disrupt-connectivity",
+            "description": "Block S3 access from the victim subnet via NACL deny rules, simulating ransomware cutting off cloud storage access",
+            "parameters": {
+                "scope": "s3",
+                "duration": "PT75M"
+            },
+            "targets": {
+                "Subnets": "victimSubnets"
+            },
+            "startAfter": ["encrypt-files"]
+        },
+        "attempt-backup-deletion": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Attempt to delete EBS snapshots and AWS Backup recovery points. Vault Lock blocks deletion — CloudTrail shows AccessDeniedException as proof.",
+            "parameters": {
+                "maxDuration": "PT5M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-backup-deletion-attempt",
+                "documentParameters": "{\"BackupVaultName\":\"fis-security-backup-vault\",\"Region\":\"<YOUR REGION>\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
+            },
+            "startAfter": ["pause-ebs", "isolate-s3"]
+        },
+        "revoke-kms-access": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Deny kms:Decrypt via KMS key policy change (S3 objects return 403), hold for customer recovery exercise, then automatically restore the original key policy. On early stop, the SSM Automation onCancel handler restores the policy immediately.",
+            "parameters": {
+                "maxDuration": "PT65M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-ransomware-kms-access-revocation",
+                "documentParameters": "{\"KMSKeyId\":\"<YOUR KMS KEY ID>\",\"InstanceRoleArn\":\"<YOUR INSTANCE ROLE ARN>\",\"Region\":\"<YOUR REGION>\",\"Duration\":\"PT60M\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
+            },
+            "startAfter": ["attempt-backup-deletion"]
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
+    "tags": {
+        "Name": "fis-security-ransomware-impact-simulation",
+        "Purpose": "security-chaos-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

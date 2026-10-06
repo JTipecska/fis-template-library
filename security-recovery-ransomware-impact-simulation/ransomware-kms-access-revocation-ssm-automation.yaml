@@ -1,0 +1,224 @@
+description: |-
+  ### Document name - fis-security-ransomware-kms-access-revocation
+
+  ## What does this document do?
+  Simulates a ransomware operator revoking decryption access to S3 objects
+  by modifying the KMS key policy. The full fault lifecycle is self-contained:
+    1. Saves the current key policy to SSM Parameter Store as a backup
+    2. Injects a Deny statement that blocks kms:Decrypt for the instance role
+    3. Waits for the customer recovery exercise window (Duration parameter)
+    4. Restores the original key policy from Parameter Store
+
+  With the Deny in place, any s3:GetObject call on objects encrypted with
+  this key returns HTTP 403 (KMS AccessDeniedException). The objects still
+  exist and are listed by s3:ListObjects — only decryption is blocked,
+  exactly as in a real ransomware-key-revocation attack.
+
+  ## Automatic rollback
+  The restore step runs automatically after the hold period expires. If the
+  SSM Automation is cancelled (e.g., the FIS experiment is stopped early),
+  the onCancel handler on each post-revocation step jumps directly to the
+  restore step. If the restore step itself fails, run
+  scripts/restore_kms_access.py as a manual safety net.
+
+  ## Input Parameters
+  * KMSKeyId: Key ID or ARN of the KMS key to modify
+  * InstanceRoleArn: ARN of the IAM role whose kms:Decrypt will be denied
+  * Duration: ISO 8601 hold duration (default: PT60M)
+  * AutomationAssumeRole: ARN of the IAM role for this automation to assume
+  * Region: AWS region (default: us-east-1)
+
+  ## Output Parameters
+  * PolicySaved: true if the original policy was saved to Parameter Store
+  * RevocationResult: REVOKED or FAILED
+  * RestoreResult: RESTORED or FAILED
+
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  KMSKeyId:
+    type: String
+    description: 'Key ID or ARN of the KMS key to modify'
+    allowedPattern: '^[a-f0-9\-]{36}$|^arn:aws:kms:.+$|^alias/.+$'
+  InstanceRoleArn:
+    type: String
+    description: 'ARN of the IAM role that will have kms:Decrypt denied'
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+  Duration:
+    type: String
+    description: 'ISO 8601 duration for the customer recovery exercise hold (default: PT60M)'
+    default: 'PT60M'
+  AutomationAssumeRole:
+    type: String
+    description: 'ARN of the IAM role for this SSM Automation to assume'
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+  Region:
+    type: String
+    description: 'AWS region where the KMS key resides'
+    default: 'us-east-1'
+    allowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+mainSteps:
+  - name: saveCurrentKeyPolicy
+    action: aws:executeScript
+    description: |
+      Save the current KMS key policy to SSM Parameter Store before modifying
+      it. This backup is read by restoreKeyPolicy (and by scripts/restore_kms_access.py
+      as a manual safety net if the automation is killed before the restore step).
+    nextStep: revokeDecryptAccess
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        key_id: '{{ KMSKeyId }}'
+      Script: |
+        import boto3
+
+        PARAMETER_NAME = '/fis-security/ransomware/kms-policy-backup'
+
+        def handler(event, context):
+            kms_client = boto3.client('kms', region_name=event['region'])
+            ssm_client = boto3.client('ssm', region_name=event['region'])
+
+            resp = kms_client.get_key_policy(
+                KeyId=event['key_id'],
+                PolicyName='default',
+            )
+            policy_json = resp['Policy']
+
+            ssm_client.put_parameter(
+                Name=PARAMETER_NAME,
+                Value=policy_json,
+                Type='String',
+                Overwrite=True,
+                Description='FIS ransomware experiment KMS key policy backup',
+            )
+            print(f'Key policy saved to Parameter Store at {PARAMETER_NAME}')
+            return {'policy_saved': True}
+    outputs:
+      - Name: PolicySaved
+        Selector: $.Payload.policy_saved
+        Type: Boolean
+
+  - name: revokeDecryptAccess
+    action: aws:executeScript
+    description: |
+      Inject a Deny statement into the KMS key policy to block kms:Decrypt for
+      the instance role. S3 GetObject calls return 403. Objects remain listed —
+      only decryption is blocked. Restore runs automatically after the hold.
+    nextStep: waitForRecoveryExercise
+    onFailure: 'step:restoreKeyPolicy'
+    onCancel: 'step:restoreKeyPolicy'
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        key_id: '{{ KMSKeyId }}'
+        instance_role_arn: '{{ InstanceRoleArn }}'
+      Script: |
+        import boto3
+        import json
+
+        def handler(event, context):
+            kms_client = boto3.client('kms', region_name=event['region'])
+
+            resp = kms_client.get_key_policy(
+                KeyId=event['key_id'],
+                PolicyName='default',
+            )
+            policy = json.loads(resp['Policy'])
+
+            deny_sid = 'FISRansomwareSimulationDecryptDeny'
+
+            # Idempotent: skip if already applied from a prior run
+            for stmt in policy.get('Statement', []):
+                if stmt.get('Sid') == deny_sid:
+                    print(f'Deny statement already present (Sid={deny_sid}). No change.')
+                    return {'revocation_result': 'REVOKED'}
+
+            policy['Statement'].append({
+                'Sid': deny_sid,
+                'Effect': 'Deny',
+                'Principal': {'AWS': event['instance_role_arn']},
+                'Action': 'kms:Decrypt',
+                'Resource': '*',
+            })
+
+            kms_client.put_key_policy(
+                KeyId=event['key_id'],
+                PolicyName='default',
+                Policy=json.dumps(policy),
+            )
+            print(
+                f'kms:Decrypt denied for {event["instance_role_arn"]} on key {event["key_id"]}. '
+                'S3 objects encrypted with this key are now inaccessible.'
+            )
+            return {'revocation_result': 'REVOKED'}
+    outputs:
+      - Name: RevocationResult
+        Selector: $.Payload.revocation_result
+        Type: String
+
+  - name: waitForRecoveryExercise
+    action: aws:sleep
+    description: |
+      Hold the experiment open for the customer recovery exercise window.
+      During this period kms:Decrypt remains denied and S3 objects are
+      inaccessible. After the sleep completes, restoreKeyPolicy runs automatically.
+      If the FIS experiment is stopped early, the onCancel handler jumps directly
+      to restoreKeyPolicy.
+    nextStep: restoreKeyPolicy
+    onFailure: 'step:restoreKeyPolicy'
+    onCancel: 'step:restoreKeyPolicy'
+    inputs:
+      Duration: '{{ Duration }}'
+
+  - name: restoreKeyPolicy
+    action: aws:executeScript
+    description: |
+      Restore the original KMS key policy from SSM Parameter Store and delete
+      the backup parameter. After this step, kms:Decrypt is re-granted and S3
+      objects become accessible again.
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        key_id: '{{ KMSKeyId }}'
+      Script: |
+        import boto3
+
+        PARAMETER_NAME = '/fis-security/ransomware/kms-policy-backup'
+
+        def handler(event, context):
+            kms_client = boto3.client('kms', region_name=event['region'])
+            ssm_client = boto3.client('ssm', region_name=event['region'])
+
+            try:
+                resp = ssm_client.get_parameter(Name=PARAMETER_NAME)
+                saved_policy = resp['Parameter']['Value']
+            except ssm_client.exceptions.ParameterNotFound:
+                print(
+                    f'Parameter {PARAMETER_NAME} not found. '
+                    'Policy may have already been restored or was never saved.'
+                )
+                return {'restore_result': 'PARAMETER_NOT_FOUND'}
+
+            kms_client.put_key_policy(
+                KeyId=event['key_id'],
+                PolicyName='default',
+                Policy=saved_policy,
+            )
+            print(f'KMS key policy restored for key {event["key_id"]}.')
+
+            ssm_client.delete_parameter(Name=PARAMETER_NAME)
+            print(f'Backup parameter {PARAMETER_NAME} deleted.')
+
+            return {'restore_result': 'RESTORED'}
+    outputs:
+      - Name: RestoreResult
+        Selector: $.Payload.restore_result
+        Type: String

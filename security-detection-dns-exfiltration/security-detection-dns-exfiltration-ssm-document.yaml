@@ -1,0 +1,48 @@
+description: |-
+  ### Document name - fis-security-dns-exfiltration
+
+  ## What does this document do?
+  Simulates data exfiltration via DNS tunneling. A common exfiltration technique
+  is to encode data in DNS subdomain queries directed at an attacker-controlled
+  domain. This test does not exfiltrate real data, but generates the pattern of
+  unusual high-volume DNS queries that GuardDuty's threat intelligence detects
+  as DNS exfiltration activity.
+
+  ## Dependencies installed by this SSM Document
+  None — uses dig which is pre-installed on Amazon Linux 2.
+
+  ## Input Parameters
+  None.
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+mainSteps:
+  - action: aws:runShellScript
+    name: ExecuteDNSExfiltration
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Simulate DNS-based data exfiltration by generating high-volume DNS queries
+      matching patterns monitored by GuardDuty threat intelligence.
+    inputs:
+      onFailure: exit
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          echo "Initiating DNS exfiltration test"
+          echo "Generating high-volume DNS queries to simulate tunneling via DNS"
+          mkdir -p ./domains
+          curl -L https://raw.githubusercontent.com/awslabs/amazon-guardduty-tester/master/artifacts/queries.txt \
+            > ./domains/queries.txt
+          dig -f ./domains/queries.txt > /dev/null &
+          echo "Finished DNS exfiltration test"

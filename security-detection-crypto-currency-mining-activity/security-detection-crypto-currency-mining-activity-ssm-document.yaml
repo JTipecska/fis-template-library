@@ -1,0 +1,48 @@
+description: |-
+  ### Document name - fis-security-crypto-currency-mining-activity
+
+  ## What does this document do?
+  Simulates cryptocurrency mining activity by making HTTP requests to known
+  cryptocurrency mining pool URLs. The requests use fabricated paths and do not
+  download any mining software or establish an actual mining session. This
+  interaction with threat-intelligence-listed domains triggers GuardDuty's
+  CryptoCurrency:EC2/BitcoinTool.B!DNS finding type.
+
+  ## Dependencies installed by this SSM Document
+  None — uses curl which is pre-installed on Amazon Linux 2.
+
+  ## Input Parameters
+  None.
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+mainSteps:
+  - action: aws:runShellScript
+    name: ExecuteCryptoCurrencyMiningActivity
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Simulate cryptocurrency mining activity by querying mining pool domains
+      monitored by GuardDuty threat intelligence lists.
+    inputs:
+      onFailure: exit
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          echo "Initiating cryptocurrency mining activity test"
+          echo "Calling bitcoin mining pool domains to trigger threat intelligence detection"
+          curl -s http://pool.minergate.com/dkjdjkjdlsajdkljalsskajdksakjdksajkllalkdjsalkjdsalkjdlkasj \
+            > /dev/null &
+          curl -s http://xmr.pool.minergate.com/dhdhjkhdjkhdjkhajkhdjskahhjkhjkahdsjkakjasdhkjahdjk \
+            > /dev/null &
+          echo "Finished cryptocurrency mining activity test"

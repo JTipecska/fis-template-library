@@ -1,0 +1,209 @@
+description: |-
+  ### Document name - fis-security-ransomware-rds-isolation
+
+  ## What does this document do?
+  Simulates a ransomware operator cutting off database access by swapping the
+  target RDS instance's security groups for an isolated one with no ingress
+  rules. This is a reversible, non-destructive fault — no data is deleted or
+  modified, and no snapshot/restore action is taken by this document. The
+  full fault lifecycle is self-contained:
+    1. Saves the instance's current security group IDs to SSM Parameter Store
+    2. Replaces them with a single isolation security group (no ingress)
+    3. Waits for the customer recovery exercise window (Duration parameter)
+    4. Restores the original security groups from Parameter Store
+
+  With the isolation security group in place, the application tier cannot
+  open new connections to the database — existing connections may continue
+  briefly until they are recycled, matching how ransomware-driven network
+  lockout actually presents (connections fail incrementally, not instantly).
+  This document targets a database you already operate — point it at your
+  own RDS instance and isolation security group rather than one provisioned
+  by this repo's CDK stack.
+
+  ## Automatic rollback
+  The restore step runs automatically after the hold period expires. If the
+  SSM Automation is cancelled (e.g., the FIS experiment is stopped early),
+  the onCancel handler on each post-isolation step jumps directly to the
+  restore step. If the restore step itself fails, re-run this document's
+  restoreSecurityGroups step manually or re-apply the saved group IDs from
+  the `/fis-security/ransomware/rds-sg-backup` parameter as a safety net.
+
+  ## Input Parameters
+  * DBInstanceIdentifier: Identifier of the RDS instance to isolate
+  * IsolationSecurityGroupId: ID of a pre-created security group with no ingress rules, in the same VPC as the DB instance
+  * Duration: ISO 8601 hold duration (default: PT60M)
+  * AutomationAssumeRole: ARN of the IAM role for this automation to assume
+  * Region: AWS region (default: us-east-1)
+
+  ## Output Parameters
+  * GroupsSaved: true if the original security group IDs were saved to Parameter Store
+  * IsolationResult: ISOLATED or FAILED
+  * RestoreResult: RESTORED or FAILED
+
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  DBInstanceIdentifier:
+    type: String
+    description: 'Identifier of the RDS instance to isolate'
+    allowedPattern: '^[a-zA-Z][a-zA-Z0-9\-]{0,62}$'
+  IsolationSecurityGroupId:
+    type: String
+    description: 'ID of a pre-created, no-ingress security group in the same VPC as the DB instance'
+    allowedPattern: '^sg-[a-f0-9]{8,17}$'
+  Duration:
+    type: String
+    description: 'ISO 8601 duration for the customer recovery exercise hold (default: PT60M)'
+    default: 'PT60M'
+  AutomationAssumeRole:
+    type: String
+    description: 'ARN of the IAM role for this SSM Automation to assume'
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+  Region:
+    type: String
+    description: 'AWS region where the RDS instance resides'
+    default: 'us-east-1'
+    allowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+mainSteps:
+  - name: saveCurrentSecurityGroups
+    action: aws:executeScript
+    description: |
+      Save the DB instance's current VPC security group IDs to SSM Parameter
+      Store before modifying them. This backup is read by restoreSecurityGroups.
+    nextStep: isolateDatabase
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        db_instance_identifier: '{{ DBInstanceIdentifier }}'
+      Script: |
+        import boto3
+        import json
+
+        PARAMETER_NAME = '/fis-security/ransomware/rds-sg-backup'
+
+        def handler(event, context):
+            rds_client = boto3.client('rds', region_name=event['region'])
+            ssm_client = boto3.client('ssm', region_name=event['region'])
+
+            resp = rds_client.describe_db_instances(
+                DBInstanceIdentifier=event['db_instance_identifier'],
+            )
+            db_instance = resp['DBInstances'][0]
+            sg_ids = [sg['VpcSecurityGroupId'] for sg in db_instance['VpcSecurityGroups']]
+
+            ssm_client.put_parameter(
+                Name=PARAMETER_NAME,
+                Value=json.dumps(sg_ids),
+                Type='String',
+                Overwrite=True,
+                Description='FIS ransomware experiment RDS security group backup',
+            )
+            print(f'Security groups {sg_ids} saved to Parameter Store at {PARAMETER_NAME}')
+            return {'groups_saved': True}
+    outputs:
+      - Name: GroupsSaved
+        Selector: $.Payload.groups_saved
+        Type: Boolean
+
+  - name: isolateDatabase
+    action: aws:executeScript
+    description: |
+      Replace the DB instance's security groups with the isolation security
+      group (no ingress). New connections from the application tier will be
+      refused; existing connections may persist briefly until recycled.
+    nextStep: waitForRecoveryExercise
+    onFailure: 'step:restoreSecurityGroups'
+    onCancel: 'step:restoreSecurityGroups'
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        db_instance_identifier: '{{ DBInstanceIdentifier }}'
+        isolation_sg_id: '{{ IsolationSecurityGroupId }}'
+      Script: |
+        import boto3
+
+        def handler(event, context):
+            rds_client = boto3.client('rds', region_name=event['region'])
+
+            rds_client.modify_db_instance(
+                DBInstanceIdentifier=event['db_instance_identifier'],
+                VpcSecurityGroupIds=[event['isolation_sg_id']],
+                ApplyImmediately=True,
+            )
+            print(
+                f'DB instance {event["db_instance_identifier"]} isolated with '
+                f'security group {event["isolation_sg_id"]}. New connections will be refused.'
+            )
+            return {'isolation_result': 'ISOLATED'}
+    outputs:
+      - Name: IsolationResult
+        Selector: $.Payload.isolation_result
+        Type: String
+
+  - name: waitForRecoveryExercise
+    action: aws:sleep
+    description: |
+      Hold the experiment open for the customer recovery exercise window.
+      During this period the database remains isolated. After the sleep
+      completes, restoreSecurityGroups runs automatically. If the FIS
+      experiment is stopped early, the onCancel handler jumps directly to
+      restoreSecurityGroups.
+    nextStep: restoreSecurityGroups
+    onFailure: 'step:restoreSecurityGroups'
+    onCancel: 'step:restoreSecurityGroups'
+    inputs:
+      Duration: '{{ Duration }}'
+
+  - name: restoreSecurityGroups
+    action: aws:executeScript
+    description: |
+      Restore the DB instance's original security groups from SSM Parameter
+      Store and delete the backup parameter. After this step, the database
+      is reachable again from the application tier.
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        db_instance_identifier: '{{ DBInstanceIdentifier }}'
+      Script: |
+        import boto3
+        import json
+
+        PARAMETER_NAME = '/fis-security/ransomware/rds-sg-backup'
+
+        def handler(event, context):
+            rds_client = boto3.client('rds', region_name=event['region'])
+            ssm_client = boto3.client('ssm', region_name=event['region'])
+
+            try:
+                resp = ssm_client.get_parameter(Name=PARAMETER_NAME)
+                sg_ids = json.loads(resp['Parameter']['Value'])
+            except ssm_client.exceptions.ParameterNotFound:
+                print(
+                    f'Parameter {PARAMETER_NAME} not found. '
+                    'Security groups may have already been restored or were never saved.'
+                )
+                return {'restore_result': 'PARAMETER_NOT_FOUND'}
+
+            rds_client.modify_db_instance(
+                DBInstanceIdentifier=event['db_instance_identifier'],
+                VpcSecurityGroupIds=sg_ids,
+                ApplyImmediately=True,
+            )
+            print(f'Security groups {sg_ids} restored for DB instance {event["db_instance_identifier"]}.')
+
+            ssm_client.delete_parameter(Name=PARAMETER_NAME)
+            print(f'Backup parameter {PARAMETER_NAME} deleted.')
+
+            return {'restore_result': 'RESTORED'}
+    outputs:
+      - Name: RestoreResult
+        Selector: $.Payload.restore_result
+        Type: String

@@ -1,0 +1,84 @@
+description: |-
+  ### Document name - fis-security-ssh-brute-force
+
+  ## What does this document do?
+  Simulates an SSH brute force attack against a target Linux instance using phony
+  compromised SSH keys. This is a common technique where threat actors harvest
+  keys from public repositories. The attempt will not succeed in obtaining access
+  to the target instance — it is purely a detection test.
+
+  ## Input Parameters
+  * TargetInstance: Private IP address of the target Linux instance
+  * InstallDependencies: If True, installs crowbar and its dependencies (default False — pre-installed by userdata)
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+parameters:
+  TargetInstance:
+    type: String
+    description: 'Target Linux machine IP address for SSH brute force simulation'
+    allowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+  InstallDependencies:
+    type: String
+    description: 'If True, install crowbar and dependencies (default: False — pre-installed by userdata)'
+    default: 'False'
+    allowedValues:
+      - 'True'
+      - 'False'
+mainSteps:
+  - action: aws:runShellScript
+    name: InstallDependencies
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Install crowbar and paramiko if InstallDependencies is True.
+    inputs:
+      onFailure: exit
+      runCommand:
+        - |
+          #!/bin/bash
+          if [[ "{{ InstallDependencies }}" != "True" ]]; then
+            echo "Skipping dependency installation."
+            exit 0
+          fi
+          echo "Installing dependencies..."
+          sudo yum install -y python3 git
+          if [[ ! -d /home/ec2-user/crowbar ]]; then
+            git clone https://github.com/galkan/crowbar.git /home/ec2-user/crowbar
+            chown -R ec2-user:ec2-user /home/ec2-user/crowbar
+          fi
+          pip3 install paramiko
+          echo "Dependency installation complete."
+
+  - action: aws:runShellScript
+    name: ExecuteSSHBruteForce
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Simulate SSH brute force with compromised keys against the target instance.
+    inputs:
+      onFailure: exit
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          echo "Initiating SSH brute force test against {{ TargetInstance }}"
+          for j in $(seq 1 5); do
+            sudo /home/ec2-user/crowbar/crowbar.py \
+              -b sshkey \
+              -s "{{ TargetInstance }}/32" \
+              -U /home/ec2-user/users \
+              -k /home/ec2-user/compromised_keys
+          done
+          echo "Finished SSH brute force test"

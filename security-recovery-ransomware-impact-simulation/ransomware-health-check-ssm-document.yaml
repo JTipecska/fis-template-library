@@ -1,0 +1,109 @@
+description: |-
+  ### Document name - fis-security-ransomware-health-check
+
+  ## What does this document do?
+  Captures a lightweight application health baseline on the target instance,
+  for use before (Phase 0) and after (Phase 5) the ransomware impact
+  simulation. Records: data directory file count/listing, mount status of
+  the data volume, local HTTP health endpoint response (if configured), and
+  a timestamp. Writes results to /tmp/fis-health-check-<Mode>.json and also
+  echoes them to stdout so they are captured in the SSM command output.
+
+  This document does not modify any resource — it is read-only, safe to run
+  at any time, and does not require the data volume to be mounted or
+  reachable (a failed check is itself a signal, not an error).
+
+  ## Input Parameters
+  * Mode: 'before' or 'after' — used only to name the output file, so the two runs don't overwrite each other
+  * HealthEndpoint: Optional local URL to curl for an application-level health check (default: none, skipped if empty)
+
+  ## Output Parameters
+  None (see stdout / /tmp/fis-health-check-<Mode>.json on the target instance).
+
+schemaVersion: '2.2'
+parameters:
+  Mode:
+    type: String
+    description: 'Which checkpoint this run represents: before or after'
+    default: 'before'
+    allowedValues:
+      - before
+      - after
+  HealthEndpoint:
+    type: String
+    description: 'Optional local URL to curl for an application health check'
+    default: ''
+mainSteps:
+  - action: aws:runShellScript
+    name: CaptureHealthBaseline
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Capture a point-in-time application health snapshot: data directory
+      state, data volume mount status, and an optional HTTP health check.
+      Never fails the SSM command — a missing mount or unreachable endpoint
+      is recorded as a finding, not a document failure, so this is safe to
+      run even while the ransomware fault is active.
+    inputs:
+      onFailure: successAndExit
+      timeoutSeconds: 60
+      runCommand:
+        - |
+          #!/bin/bash
+
+          MODE="{{ Mode }}"
+          HEALTH_ENDPOINT="{{ HealthEndpoint }}"
+          TEST_DIR="/data/test-files"
+          OUT_FILE="/tmp/fis-health-check-${MODE}.json"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          echo "=== FIS Ransomware Health Check (${MODE}) — ${TIMESTAMP} ==="
+
+          if mountpoint -q /data 2>/dev/null; then
+            MOUNT_STATUS="mounted"
+          else
+            MOUNT_STATUS="not_mounted"
+          fi
+          echo "Data volume mount status: ${MOUNT_STATUS}"
+
+          if [ -d "${TEST_DIR}" ]; then
+            TXT_COUNT=$(ls "${TEST_DIR}"/*.txt 2>/dev/null | wc -l)
+            ENC_COUNT=$(ls "${TEST_DIR}"/*.enc 2>/dev/null | wc -l)
+            RANSOM_NOTE_PRESENT="false"
+            [ -f "${TEST_DIR}/RANSOM_NOTE.txt" ] && RANSOM_NOTE_PRESENT="true"
+          else
+            TXT_COUNT=0
+            ENC_COUNT=0
+            RANSOM_NOTE_PRESENT="false"
+          fi
+          echo "Test files: ${TXT_COUNT} .txt / ${ENC_COUNT} .enc (ransom note present: ${RANSOM_NOTE_PRESENT})"
+
+          HEALTH_RESULT="skipped"
+          HEALTH_HTTP_CODE="n/a"
+          if [ -n "${HEALTH_ENDPOINT}" ]; then
+            HEALTH_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${HEALTH_ENDPOINT}" || echo "unreachable")
+            if [ "${HEALTH_HTTP_CODE}" = "200" ]; then
+              HEALTH_RESULT="healthy"
+            else
+              HEALTH_RESULT="unhealthy"
+            fi
+          fi
+          echo "Application health endpoint: ${HEALTH_RESULT} (http_code=${HEALTH_HTTP_CODE})"
+
+          cat > "${OUT_FILE}" <<JSONEOF
+          {
+            "mode": "${MODE}",
+            "timestamp": "${TIMESTAMP}",
+            "data_volume_mount_status": "${MOUNT_STATUS}",
+            "test_files_txt_count": ${TXT_COUNT},
+            "test_files_enc_count": ${ENC_COUNT},
+            "ransom_note_present": ${RANSOM_NOTE_PRESENT},
+            "health_endpoint_result": "${HEALTH_RESULT}",
+            "health_endpoint_http_code": "${HEALTH_HTTP_CODE}"
+          }
+          JSONEOF
+
+          echo "Health snapshot written to ${OUT_FILE}"
+          exit 0

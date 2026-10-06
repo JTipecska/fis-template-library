@@ -1,0 +1,287 @@
+description: |-
+  ### Document name - fis-security-ransomware-backup-deletion-attempt
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  WARNING: THIS DOCUMENT WILL ATTEMPT TO DELETE BACKUPS.
+
+  If your AWS Backup vault does NOT have Vault Lock configured, recovery points
+  WILL BE PERMANENTLY DELETED with no possibility of recovery. This document
+  is designed to PROVE that Vault Lock prevents deletion. Run it only against
+  a vault that has Vault Lock enabled. Verify your vault configuration in the
+  AWS Backup console before proceeding.
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  ## What does this document do?
+  Simulates the backup-tampering phase of a ransomware attack. It attempts to:
+    1. Delete the most recent EBS snapshot tagged FIS-Ready=True
+    2. Delete the most recent recovery point from the target backup vault
+
+  In a correctly configured environment (Vault Lock enabled), both attempts are
+  blocked with AccessDeniedException. The results are published to CloudWatch
+  metrics (namespace: FISSecurityExperiments) and logged to SSM output so the
+  customer can verify their backup protection worked.
+
+  If Vault Lock is NOT configured, deletion will succeed and the backup will
+  be permanently lost.
+
+  ## Input Parameters
+  * BackupVaultName: Name of the AWS Backup vault to test
+  * AutomationAssumeRole: ARN of the IAM role for this automation to assume
+  * Region: AWS region (default: us-east-1)
+
+  ## Output Parameters
+  * SnapshotDeletionResult: BLOCKED or DELETED or NONE_FOUND
+  * RecoveryPointDeletionResult: BLOCKED_BY_VAULT_LOCK or DELETED_NO_VAULT_LOCK or NONE_FOUND
+
+schemaVersion: '0.3'
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  BackupVaultName:
+    type: String
+    description: 'Name of the AWS Backup vault to test (must have Vault Lock enabled)'
+    allowedPattern: '^[a-zA-Z0-9\-\_\.]{1,50}$'
+  AutomationAssumeRole:
+    type: String
+    description: 'ARN of the IAM role for this SSM Automation to assume'
+    allowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+  Region:
+    type: String
+    description: 'AWS region where resources reside'
+    default: 'us-east-1'
+    allowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+mainSteps:
+  - name: discoverSnapshots
+    action: aws:executeScript
+    description: Find the most recent EBS snapshot tagged FIS-Ready=True.
+    onFailure: step:discoverRecoveryPoints
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+      Script: |
+        import boto3
+
+        def handler(event, context):
+            ec2 = boto3.client('ec2', region_name=event['region'])
+            resp = ec2.describe_snapshots(
+                Filters=[
+                    {'Name': 'tag:FIS-Ready', 'Values': ['True']},
+                    {'Name': 'status', 'Values': ['completed']},
+                ],
+                OwnerIds=['self'],
+            )
+            snapshots = sorted(
+                resp.get('Snapshots', []),
+                key=lambda s: s['StartTime'],
+                reverse=True,
+            )
+            if not snapshots:
+                print('No FIS-Ready snapshots found.')
+                return {'snapshot_id': 'NONE'}
+            snap_id = snapshots[0]['SnapshotId']
+            print(f'Found snapshot: {snap_id} ({snapshots[0]["StartTime"]})')
+            return {'snapshot_id': snap_id}
+    outputs:
+      - Name: SnapshotId
+        Selector: $.Payload.snapshot_id
+        Type: String
+
+  - name: attemptSnapshotDeletion
+    action: aws:executeScript
+    description: |
+      Attempt to delete the discovered snapshot.
+      Expected result with a protected snapshot: ClientError is caught and
+      result is BLOCKED. If unprotected, the snapshot is deleted (DELETED).
+    onFailure: step:discoverRecoveryPoints
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        snapshot_id: '{{ discoverSnapshots.SnapshotId }}'
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def handler(event, context):
+            snapshot_id = event['snapshot_id']
+            if snapshot_id == 'NONE':
+                print('No snapshot to attempt deletion on.')
+                return {'snapshot_deletion_result': 'NONE_FOUND'}
+
+            ec2 = boto3.client('ec2', region_name=event['region'])
+            print(f'Attempting to delete snapshot: {snapshot_id}')
+            try:
+                ec2.delete_snapshot(SnapshotId=snapshot_id)
+                print(f'WARNING: Snapshot {snapshot_id} was DELETED. '
+                      'EBS snapshot was not protected.')
+                return {'snapshot_deletion_result': 'DELETED'}
+            except ClientError as e:
+                code = e.response['Error']['Code']
+                print(f'Snapshot deletion blocked: {code} — {e.response["Error"]["Message"]}')
+                return {'snapshot_deletion_result': 'BLOCKED'}
+    outputs:
+      - Name: SnapshotDeletionResult
+        Selector: $.Payload.snapshot_deletion_result
+        Type: String
+
+  - name: discoverRecoveryPoints
+    action: aws:executeScript
+    description: Find the most recent recovery point in the target backup vault.
+    onFailure: step:reportResults
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        vault_name: '{{ BackupVaultName }}'
+      Script: |
+        import boto3
+
+        def handler(event, context):
+            backup = boto3.client('backup', region_name=event['region'])
+            resp = backup.list_recovery_points_by_backup_vault(
+                BackupVaultName=event['vault_name'],
+            )
+            points = sorted(
+                resp.get('RecoveryPoints', []),
+                key=lambda p: p['CreationDate'],
+                reverse=True,
+            )
+            if not points:
+                print(f'No recovery points found in vault: {event["vault_name"]}')
+                return {'recovery_point_arn': 'NONE'}
+            arn = points[0]['RecoveryPointArn']
+            print(f'Found recovery point: {arn} ({points[0]["CreationDate"]})')
+            return {'recovery_point_arn': arn}
+    outputs:
+      - Name: RecoveryPointArn
+        Selector: $.Payload.recovery_point_arn
+        Type: String
+
+  - name: attemptRecoveryPointDeletion
+    action: aws:executeScript
+    description: |
+      Attempt to delete the discovered recovery point.
+      Expected result with Vault Lock enabled: AccessDeniedException is caught
+      and result is BLOCKED_BY_VAULT_LOCK. If Vault Lock is NOT enabled, the
+      recovery point is permanently deleted (DELETED_NO_VAULT_LOCK).
+    onFailure: step:reportResults
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        vault_name: '{{ BackupVaultName }}'
+        recovery_point_arn: '{{ discoverRecoveryPoints.RecoveryPointArn }}'
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def handler(event, context):
+            arn = event['recovery_point_arn']
+            if arn == 'NONE':
+                print('No recovery point to attempt deletion on.')
+                return {'recovery_point_deletion_result': 'NONE_FOUND'}
+
+            backup = boto3.client('backup', region_name=event['region'])
+            print(f'Attempting to delete recovery point: {arn}')
+            try:
+                backup.delete_recovery_point(
+                    BackupVaultName=event['vault_name'],
+                    RecoveryPointArn=arn,
+                )
+                print('WARNING: Recovery point was DELETED. '
+                      'Vault Lock was NOT configured — backup is permanently lost.')
+                return {'recovery_point_deletion_result': 'DELETED_NO_VAULT_LOCK'}
+            except ClientError as e:
+                code = e.response['Error']['Code']
+                print(f'Recovery point deletion blocked: {code} — '
+                      f'{e.response["Error"]["Message"]}')
+                print('Vault Lock is working correctly.')
+                return {'recovery_point_deletion_result': 'BLOCKED_BY_VAULT_LOCK'}
+    outputs:
+      - Name: RecoveryPointDeletionResult
+        Selector: $.Payload.recovery_point_deletion_result
+        Type: String
+
+  - name: reportResults
+    action: aws:executeScript
+    description: Publish CloudWatch metrics and log a summary of deletion attempt results.
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        region: '{{ Region }}'
+        snapshot_result: '{{ attemptSnapshotDeletion.SnapshotDeletionResult }}'
+        recovery_point_result: '{{ attemptRecoveryPointDeletion.RecoveryPointDeletionResult }}'
+      Script: |
+        import boto3
+        import json
+
+        def handler(event, context):
+            cw = boto3.client('cloudwatch', region_name=event['region'])
+            snap_result = event.get('snapshot_result', 'UNKNOWN')
+            rp_result = event.get('recovery_point_result', 'UNKNOWN')
+
+            # 1 = protected, 0 = deleted (vulnerable), -1 = no artifact to test
+            if snap_result == 'BLOCKED':
+                snap_metric = 1
+            elif snap_result == 'NONE_FOUND':
+                snap_metric = -1
+            else:
+                snap_metric = 0
+
+            if rp_result == 'BLOCKED_BY_VAULT_LOCK':
+                vault_metric = 1
+            elif rp_result == 'NONE_FOUND':
+                vault_metric = -1
+            else:
+                vault_metric = 0
+
+            cw.put_metric_data(
+                Namespace='FISSecurityExperiments',
+                MetricData=[
+                    {
+                        'MetricName': 'RansomwareTestSnapshotProtected',
+                        'Value': snap_metric,
+                        'Unit': 'Count',
+                        'Dimensions': [{'Name': 'ExperimentType', 'Value': 'RansomwareImpactSimulation'}],
+                    },
+                    {
+                        'MetricName': 'RansomwareTestVaultLockProtected',
+                        'Value': vault_metric,
+                        'Unit': 'Count',
+                        'Dimensions': [{'Name': 'ExperimentType', 'Value': 'RansomwareImpactSimulation'}],
+                    },
+                ],
+            )
+
+            if vault_metric == 1:
+                verdict = 'BACKUP_PROTECTED'
+            elif vault_metric == -1:
+                verdict = 'PREREQUISITE_NOT_MET — run scripts/seed_backups.py before the experiment'
+            else:
+                verdict = 'BACKUP_VULNERABLE — configure Vault Lock immediately'
+
+            summary = {
+                'snapshot_deletion_result': snap_result,
+                'recovery_point_deletion_result': rp_result,
+                'snapshot_metric': snap_metric,
+                'vault_lock_metric': vault_metric,
+                'overall_verdict': verdict,
+            }
+            print(json.dumps(summary, indent=2))
+            return summary
+    outputs:
+      - Name: SnapshotDeletionResult
+        Selector: $.Payload.snapshot_deletion_result
+        Type: String
+      - Name: RecoveryPointDeletionResult
+        Selector: $.Payload.recovery_point_deletion_result
+        Type: String
+      - Name: OverallVerdict
+        Selector: $.Payload.overall_verdict
+        Type: String

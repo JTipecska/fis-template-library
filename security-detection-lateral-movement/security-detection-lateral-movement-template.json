@@ -1,0 +1,41 @@
+{
+    "description": "Simulate internal reconnaissance via port scan from attacker (Red1) to victim (Blue1) to validate GuardDuty Recon:EC2/PortProbeUnprotectedPort detection.",
+    "targets": {
+        "attackerInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "Name": "fis-security-red1"
+            },
+            "selectionMode": "COUNT(1)"
+        }
+    },
+    "actions": {
+        "run-lateral-movement": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run port scan simulation script on the attacker instance",
+            "parameters": {
+                "duration": "PT5M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-lateral-movement",
+                "documentParameters": "{\"TargetInstance\":\"10.0.0.11\",\"InstallDependencies\":\"False\"}"
+            },
+            "targets": {
+                "Instances": "attackerInstances"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
+    "tags": {
+        "Name": "fis-security-lateral-movement",
+        "Purpose": "security-chaos-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

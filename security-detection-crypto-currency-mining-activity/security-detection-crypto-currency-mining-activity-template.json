@@ -1,0 +1,41 @@
+{
+    "description": "Simulate cryptocurrency mining activity on victim (Blue1) to validate GuardDuty CryptoCurrency:EC2/BitcoinTool.B!DNS detection.",
+    "targets": {
+        "victimInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "Name": "fis-security-blue1"
+            },
+            "selectionMode": "COUNT(1)"
+        }
+    },
+    "actions": {
+        "run-crypto-mining": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run cryptocurrency mining activity simulation script on the victim instance",
+            "parameters": {
+                "duration": "PT5M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-crypto-currency-mining-activity",
+                "documentParameters": "{}"
+            },
+            "targets": {
+                "Instances": "victimInstances"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
+    "tags": {
+        "Name": "fis-security-crypto-currency-mining-activity",
+        "Purpose": "security-chaos-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

@@ -1,0 +1,41 @@
+{
+    "description": "Simulate DNS-based data exfiltration on victim (Blue1) to validate GuardDuty Trojan:EC2/DNSDataExfiltration detection.",
+    "targets": {
+        "victimInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "Name": "fis-security-blue1"
+            },
+            "selectionMode": "COUNT(1)"
+        }
+    },
+    "actions": {
+        "run-dns-exfiltration": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run DNS exfiltration simulation script on the victim instance",
+            "parameters": {
+                "duration": "PT5M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/fis-security-dns-exfiltration",
+                "documentParameters": "{}"
+            },
+            "targets": {
+                "Instances": "victimInstances"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
+    "tags": {
+        "Name": "fis-security-dns-exfiltration",
+        "Purpose": "security-chaos-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

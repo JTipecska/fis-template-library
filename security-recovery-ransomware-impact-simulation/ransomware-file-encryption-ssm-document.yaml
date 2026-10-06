@@ -1,0 +1,115 @@
+description: |-
+  ### Document name - fis-security-ransomware-file-encryption
+
+  ## What does this document do?
+  Simulates the file-encryption impact phase of a ransomware attack on the data
+  volume mounted at /data/test-files/. It renames all .txt files to .enc and
+  drops a mock ransom note, making application data inaccessible without
+  performing any real encryption. Recovery is intentionally NOT included in this
+  document — the customer must restore /data from their AWS Backup Vault
+  recovery point as part of the remediation exercise.
+
+  ## Input Parameters
+  None.
+
+  ## Output Parameters
+  None.
+
+schemaVersion: '2.2'
+mainSteps:
+  - action: aws:runShellScript
+    name: CreateTestData
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Create /data/test-files/ with sample .txt files if they don't already exist.
+      Idempotent: skips creation if .enc files are already present from a prior run.
+    inputs:
+      onFailure: exit
+      timeoutSeconds: 60
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+
+          TEST_DIR="/data/test-files"
+          mkdir -p "${TEST_DIR}"
+
+          if ls "${TEST_DIR}"/*.enc 2>/dev/null | head -1 | grep -q '.'; then
+            echo "Encrypted files already present — skipping test data creation."
+            exit 0
+          fi
+
+          for i in $(seq -w 1 10); do
+            cat > "${TEST_DIR}/report_${i}.txt" <<DATAEOF
+          FIS Ransomware Simulation Test File ${i}
+          Created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          Contents: Sample application data for ransomware resilience test.
+          DATAEOF
+          done
+
+          echo "Created 10 test files in ${TEST_DIR}."
+
+  - action: aws:runShellScript
+    name: SimulateEncryption
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    description: |
+      Rename all .txt files to .enc and drop a ransom note.
+      This simulates data being encrypted and inaccessible without modifying
+      any real encryption keys or performing irreversible operations.
+    inputs:
+      onFailure: exit
+      timeoutSeconds: 60
+      maxAttempts: 1
+      runCommand:
+        - |
+          #!/bin/bash
+
+          ########################
+          # Fault-specific logic #
+          ########################
+
+          TEST_DIR="/data/test-files"
+
+          if ! ls "${TEST_DIR}"/*.txt 2>/dev/null | head -1 | grep -q '.'; then
+            echo "No .txt files found in ${TEST_DIR} — nothing to encrypt."
+            exit 0
+          fi
+
+          echo "Initiating ransomware file encryption simulation"
+          for f in "${TEST_DIR}"/*.txt; do
+            mv "${f}" "${f%.txt}.enc"
+            echo "  Encrypted: $(basename ${f}) -> $(basename ${f%.txt}.enc)"
+          done
+
+          printf '%s\n' \
+            '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' \
+            'YOUR FILES HAVE BEEN ENCRYPTED — FIS SIMULATION' \
+            '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' \
+            '' \
+            'This is a simulated ransomware attack as part of an AWS' \
+            'Fault Injection Service resilience test.' \
+            '' \
+            'No real encryption has occurred. File contents are intact' \
+            'inside the renamed .enc files.' \
+            '' \
+            'To recover:' \
+            '  1. Confirm your AWS Backup Vault Lock blocked backup deletion' \
+            '     (check CloudWatch metric: RansomwareTestVaultLockProtected)' \
+            '  2. Restore the recovery point from fis-security-backup-vault' \
+            '     to a new EBS volume' \
+            '  3. Detach this volume, attach the restored volume at /dev/xvdf' \
+            '  4. Mount and verify file contents' \
+            '' \
+            '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!' \
+            > "${TEST_DIR}/RANSOM_NOTE.txt"
+
+          echo "Finished ransomware file encryption simulation."
+          echo "Files renamed to .enc. Ransom note written to ${TEST_DIR}/RANSOM_NOTE.txt"
+          echo "The data volume will remain inaccessible (EBS I/O paused) for ~75 minutes."
+          echo "Use the 60-minute hold window to exercise your restore-from-backup runbook."
