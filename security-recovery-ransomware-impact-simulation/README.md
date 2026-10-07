@@ -6,7 +6,13 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 > **⚠️ BACKUP DELETION WARNING:** This experiment includes an automation document (`fis-security-ransomware-backup-deletion-attempt`) that will **attempt to permanently delete an EBS snapshot and an AWS Backup recovery point**. If your backup vault does **not** have AWS Backup Vault Lock configured, backups **will be deleted with no possibility of recovery**. Verify your vault has Vault Lock enabled in the AWS Backup console **before running this experiment**.
 
-> **⚠️ KMS KEY POLICY WARNING:** This experiment modifies the KMS key policy to deny `kms:Decrypt` to the instance role. The KMS automation document **automatically restores the original policy** after the 60-minute hold expires, or immediately if the experiment is stopped early. If the automation is killed unexpectedly before the restore step runs, use `python scripts/restore_kms_access.py` as a manual safety net.
+> **⚠️ KMS KEY POLICY WARNING:** This experiment modifies the KMS key policy to deny `kms:Decrypt` to the instance role. The KMS automation document **automatically restores the original policy** after the 60-minute hold expires, or immediately if the experiment is stopped early. If the automation is killed unexpectedly before the restore step runs, the original policy is saved in SSM Parameter Store at `/fis-security/ransomware/kms-policy-backup` — restore it manually as a safety net:
+> ```bash
+> aws kms put-key-policy \
+>   --key-id <your-kms-key-id> \
+>   --policy-name default \
+>   --policy "$(aws ssm get-parameter --name /fis-security/ransomware/kms-policy-backup --query 'Parameter.Value' --output text)"
+> ```
 
 ## Hypothesis
 
@@ -20,28 +26,45 @@ When a ransomware attack renders application data inaccessible — through file 
 
 Before running this experiment, ensure that:
 
-> **Note on helper scripts:** The `seed_backups.py` and `restore_kms_access.py` scripts referenced below are provided by the companion deployment project that provisions the target resources (EBS data volume, backup vault, KMS key, S3 test objects). They are not part of this template-library directory. If you are wiring these templates into your own environment, create the equivalent recovery points and KMS-encrypted test objects yourself, or substitute the equivalent AWS CLI / console steps described in each prerequisite.
-
 1. You have the necessary permissions to start FIS experiments, pause EBS volumes, disrupt VPC connectivity, and run SSM documents.
 2. The IAM role specified in `roleArn` has the permissions defined in `security-recovery-ransomware-impact-simulation-fis-iam-policy.json`.
 3. The SSM Automation role specified in `documentParameters.AutomationAssumeRole` has the permissions defined in `security-recovery-ransomware-impact-simulation-ssm-automation-iam-policy.json`.
 4. An EC2 instance tagged `FIS-Ready=True` and `Name=fis-security-blue1` is running and registered with AWS Systems Manager.
 5. A secondary EBS data volume tagged `FIS-Ready=True` and `Name=fis-security-blue1-data` is attached to Blue1 and mounted at `/data`. This is the volume that will have its I/O paused — the root volume is not affected, so SSM remains operational throughout.
 6. The VPC subnet containing Blue1 is tagged `FIS-Ready=True`. The `isolate-s3` action adds NACL deny rules to this subnet.
-7. **AWS Backup Vault Lock is enabled** on the vault named `fis-security-backup-vault` (governance or compliance mode). Without Vault Lock, backups will be permanently deleted.
-8. Run `python scripts/seed_backups.py` to create **two EBS snapshots and two AWS Backup recovery points** (`Candidate=clean` and `Candidate=post-change`) plus 5 KMS-encrypted S3 test objects. The two recovery points simulate a clean backup (predating the attack) and a potentially-contaminated backup (taken during an attacker's dwell period) — you will need to identify the correct one during Phase 4. The daily backup plan runs at 02:00 UTC but `seed_backups.py` creates them immediately.
-9. `scripts/restore_kms_access.py` is available as a **manual safety net** if the KMS automation is killed before its restore step runs. Under normal operation (experiment completes or is stopped via the console), the key policy is restored automatically — you do not need to run this script.
+7. **AWS Backup Vault Lock is enabled** on the vault named `fis-security-backup-vault` (governance or compliance mode). Without Vault Lock, backups will be permanently deleted. Verify with:
+   ```bash
+   aws backup describe-backup-vault --backup-vault-name fis-security-backup-vault
+   ```
+8. **Create two AWS Backup recovery points to use as restore candidates**, tagged so Phase 4 Stage 2 can tell them apart:
+   - Take an on-demand backup of the `fis-security-blue1-data` volume now, before writing any test files — tag it `Candidate=clean`:
+     ```bash
+     aws backup start-backup-job \
+       --backup-vault-name fis-security-backup-vault \
+       --resource-arn arn:aws:ec2:<your-region>:<your-account>:volume/<your-volume-id> \
+       --iam-role-arn <your-backup-service-role-arn> \
+       --recovery-point-tags Candidate=clean
+     ```
+   - Write a few test files to `/data/test-files/` on Blue1, then take a second on-demand backup tagged `Candidate=post-change`, using the same command with the tag changed. This simulates a backup taken during an attacker's dwell period — Phase 4 Stage 2 asks you to identify the correct (pre-attack) one to restore from.
+   - Wait for both backup jobs to reach `COMPLETED` (`aws backup describe-backup-job --backup-job-id <id>`) before starting the experiment.
+9. **Create a small set of KMS-encrypted S3 test objects**, so Phase 3's KMS key-policy revocation has something to deny access to:
+   ```bash
+   aws s3 cp ./ransomware-test-01.txt s3://<your-bucket>/test-files/ \
+     --sse aws:kms --sse-kms-key-id <your-kms-key-id>
+   ```
+   Repeat for a handful of objects (5 is enough to see the effect clearly during Phase 4 Stage 4's verification step).
+10. **Know how to restore the KMS key policy manually**, in case the automation is interrupted before its restore step runs — see the KMS key policy warning above for the exact command. Under normal operation (experiment completes or is stopped via the console) the policy is restored automatically; you do not need to do this unless the automation itself was killed.
 
 **Detection infrastructure (required for a realistic exercise):**
 
-10. **AWS CloudTrail with management events enabled** — the investigation stage depends on CloudTrail. Without it, `DeleteRecoveryPoint AccessDeniedException` events are not queryable. Verify with: `aws cloudtrail get-event-selectors --trail-name <your-trail>`.
-11. **Amazon GuardDuty enabled** — GuardDuty generates findings when the experiment injects anomalous API calls. Having it active gives you a real detection feed to work with during Phase 4.
-12. **VPC Flow Logs enabled** on the VPC — needed to trace network-level activity during Phase 2 (S3 isolation). Enable from: VPC Console → Your VPC → Flow Logs → Create.
+11. **AWS CloudTrail with management events enabled** — the investigation stage depends on CloudTrail. Without it, `DeleteRecoveryPoint AccessDeniedException` events are not queryable. Verify with: `aws cloudtrail get-event-selectors --trail-name <your-trail>`.
+12. **Amazon GuardDuty enabled** — GuardDuty generates findings when the experiment injects anomalous API calls. Having it active gives you a real detection feed to work with during Phase 4.
+13. **VPC Flow Logs enabled** on the VPC — needed to trace network-level activity during Phase 2 (S3 isolation). Enable from: VPC Console → Your VPC → Flow Logs → Create.
 
 **Prepare before you start:**
 
-13. **Know your restore runbook** — document the steps to find a recovery point, start a restore job, attach the restored volume, and verify data before running the experiment. Phase 4's 60-minute window is not the time to discover the runbook for the first time.
-14. **Note your target RTO** — decide in advance how long a restore should take. You will measure your actual time against it during Phase 4.
+14. **Know your restore runbook** — document the steps to find a recovery point, start a restore job, attach the restored volume, and verify data before running the experiment. Phase 4's 60-minute window is not the time to discover the runbook for the first time.
+15. **Note your target RTO** — decide in advance how long a restore should take. You will measure your actual time against it during Phase 4.
 
 ## How It Works
 
@@ -72,7 +95,7 @@ In parallel, FIS starts the `fis-security-ransomware-kms-access-revocation` SSM 
 
 From this point, any `s3:GetObject` on objects encrypted with that key returns HTTP 403 (KMS AccessDeniedException). `s3:ListObjects` still works — the objects are visibly present but cryptographically inaccessible, mirroring a real ransomware key-revocation attack.
 
-The SSM Automation for `revoke-kms-access` handles the full fault lifecycle internally: it saves the key policy, applies the Deny, sleeps for 60 minutes (`aws:sleep PT60M`), then restores the original policy. If the FIS experiment is stopped early, the `onCancel` handler on each post-revocation step jumps directly to the restore step. `scripts/restore_kms_access.py` is only needed if the automation is killed before reaching the restore step.
+The SSM Automation for `revoke-kms-access` handles the full fault lifecycle internally: it saves the key policy, applies the Deny, sleeps for 60 minutes (`aws:sleep PT60M`), then restores the original policy. If the FIS experiment is stopped early, the `onCancel` handler on each post-revocation step jumps directly to the restore step. The manual restore command in the KMS key policy warning above is only needed if the automation is killed before reaching the restore step.
 
 ### Phase 4 — Recovery Exercise Window (t≈20 min, 60 min hold — built into KMS automation)
 
@@ -88,7 +111,7 @@ The data volume remains paused, S3 access remains isolated, and KMS decryption r
 #### Stage 2 — Validate Recovery Point Candidates (minutes 5–15, overlaps Stage 1)
 
 5. Open **AWS Backup → `fis-security-backup-vault` → Recovery points**.
-6. You will see two recovery points created by `seed_backups.py`:
+6. You created these two recovery points yourself in Prerequisites step 8:
    - `Candidate=clean` — created **before** any attack simulation. This is your safe restore candidate.
    - `Candidate=post-change` — created **after** test files were already written. This simulates a backup taken during an attacker's dwell period. **Do not use this one.**
 7. Compare the recovery point creation timestamps to the CloudTrail attack time from step 1. The correct candidate predates the attack.
@@ -175,7 +198,7 @@ The blog requires a second IAM Identity Center identity to approve any restore j
 
 **4. Dwell-time contamination**
 
-The `post-change` recovery point created by `seed_backups.py` illustrates an important real-world threat: if an attacker is present in the environment for days before the destructive event, backups taken during that dwell window may carry ransomware indicators or modified files. In this experiment the volume content is identical in both recovery points — only the timestamps differ. In production: maintain backup retention that exceeds your organization's realistic detection window, and always compare recovery point timestamps to the earliest plausible compromise indicator before restoring.
+The `post-change` recovery point you created in Prerequisites step 8 illustrates an important real-world threat: if an attacker is present in the environment for days before the destructive event, backups taken during that dwell window may carry ransomware indicators or modified files. In this experiment the volume content is identical in both recovery points — only the timestamps and the test-file writes between them differ. In production: maintain backup retention that exceeds your organization's realistic detection window, and always compare recovery point timestamps to the earliest plausible compromise indicator before restoring.
 
 ## Optional Additions
 
@@ -211,9 +234,9 @@ include stop conditions by default.
 **CloudWatch Metrics** (namespace: `FISSecurityExperiments`):
 - `RansomwareTestVaultLockProtected = 1` → Vault Lock blocked backup deletion ✓
 - `RansomwareTestVaultLockProtected = 0` → Backup was deleted — configure Vault Lock ✗
-- `RansomwareTestVaultLockProtected = -1` → No recovery point found — run `seed_backups.py` first ⚠️
+- `RansomwareTestVaultLockProtected = -1` → No recovery point found — complete Prerequisites step 8 first ⚠️
 - `RansomwareTestSnapshotProtected = 1` → EBS snapshot was protected ✓
-- `RansomwareTestSnapshotProtected = -1` → No snapshot found — run `seed_backups.py` first ⚠️
+- `RansomwareTestSnapshotProtected = -1` → No snapshot found — complete Prerequisites step 8 first ⚠️
 
 **CloudTrail:**
 Search for events with `eventName = DeleteRecoveryPoint` and `errorCode = AccessDeniedException`. These confirm Vault Lock blocked the simulated ransomware.
