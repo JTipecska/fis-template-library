@@ -14,3 +14,4 @@ cdk.out
 .idea/
 
 test_harnesses/
+__pycache__/
