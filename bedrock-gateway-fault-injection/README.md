@@ -91,6 +91,32 @@ Alternatively, for a drill that does not need a real upstream, set `PASSTHROUGH_
 
 You cannot modify the managed gateway itself, so inject *behind* it: register an inference-provider target (or an HTTP passthrough target) whose endpoint is the injector, and have the injector forward to the real provider. Set `RESPONSE_STYLE=openai` (AgentCore inference targets are OpenAI-compatible on `/v1/chat/completions`) and `PASSTHROUGH_MODE=forward` with `UPSTREAM_BASE_URL` set to the real provider endpoint. The application keeps calling the same AgentCore Gateway endpoint — only the target's upstream is the injector.
 
+Concretely, the inference provider target's `endpoint` is set to the injector (it must be a public HTTPS URL with a valid certificate), and the gateway authenticates its upstream calls with its own IAM role (`GATEWAY_IAM_ROLE` credential provider):
+
+```bash
+# 1. Create the gateway (authorizer NONE for a drill; use CUSTOM_JWT/AWS_IAM in real use).
+aws bedrock-agentcore-control create-gateway \
+  --name my-fis-gateway --role-arn arn:aws:iam::<ACCT>:role/<GATEWAY ROLE> \
+  --authorizer-type NONE --protocol-type MCP --region <REGION>
+
+# 2. Attach an inference provider target whose endpoint is the injector.
+#    target-configuration.json:
+#    { "inference": { "provider": {
+#        "endpoint": "https://<INJECTOR PUBLIC HTTPS>/v1",
+#        "operations": [ { "path": "/v1/chat/completions",
+#                          "models": [ { "model": "anthropic.claude-3-5-sonnet-*" } ] } ] } } }
+#    credential-provider-configurations.json: [ { "credentialProviderType": "GATEWAY_IAM_ROLE" } ]
+aws bedrock-agentcore-control create-gateway-target \
+  --gateway-identifier <GATEWAY ID> --name inj-inference-target \
+  --target-configuration file://target-configuration.json \
+  --credential-provider-configurations file://credential-provider-configurations.json \
+  --region <REGION>
+```
+
+The gateway's IAM role needs `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`, and the `bedrock:List*` / `bedrock:Get*` discovery actions it uses to enumerate models from the endpoint on target creation.
+
+> **Verification note (2026-10-21, account 291534835833, us-east-1).** This path was validated against the live `bedrock-agentcore-control` API: a gateway plus an `inference.provider` target with a `GATEWAY_IAM_ROLE` credential provider was created and reached `READY`, with the gateway successfully performing model discovery against the configured endpoint using its IAM role (the target first failed with `403 bedrock:ListFoundationModels` / `ListProvisionedModelThroughputs` until those actions were granted — confirming the gateway really does make the outbound calls the injector would intercept). Pointing the target `endpoint` at a live public-HTTPS injector and observing injected 503/429/529 end-to-end was **not** completed here because it requires the injector published at a public HTTPS endpoint with a valid certificate; the injector's own SSM-driven 503/429/529 behaviour is separately proven (see the injector smoke tests). All test gateway resources were torn down after verification.
+
 ## Configure and run the experiment
 
 1. Create the SSM Automation document from `bedrock-gateway-fault-injection-automation.yaml`.
@@ -100,6 +126,72 @@ You cannot modify the managed gateway itself, so inject *behind* it: register an
    - `LatencyMs` — optional delay before the error (exercises timeouts/cooling-off)
    - `DurationSeconds` — how long faults stay active before clean disable
 3. Import and run the experiment template using the [FIS Template Library Tooling](https://github.com/aws-samples/fis-template-library-tooling).
+
+## Tuning the fault parameters
+
+The fault is controlled by five SSM parameters under `/bedrock-fis/{InjectorId}/`, which the SSM Automation document writes from its `documentParameters`. You can also set them directly with `aws ssm put-parameter` for ad-hoc testing. The injector re-reads them every `CONFIG_TTL_SECONDS` (default 10), so a change takes effect within one TTL.
+
+| SSM parameter | `documentParameters` key | Values | Meaning |
+|---|---|---|---|
+| `active` | (set by the automation) | `true` \| `false` | Master switch. Written `true` last on enable, `false` first on disable. |
+| `fault_type` | `FaultType` | `503` \| `429` \| `529` | Which error to emit. |
+| `fault_rate` | `FaultRate` | `0.0`–`1.0` | Probability each request is faulted. |
+| `latency_ms` | `LatencyMs` | integer ≥ 0 | Delay (ms) applied before the error. |
+| `execution_id` | (set by the automation) | string | Correlation id, echoed in the `x-fault-execution-id` header. |
+
+### Which error to inject, and when
+
+| Fault | HTTP | Error shape (`aws` style) | Real-world meaning | Inject it to test |
+|---|---|---|---|---|
+| **503** | 503 | `ServiceUnavailableException` | Service temporarily out of capacity on shared on-demand infra. The official Bedrock guidance says **retry 503 with exponential backoff + jitter**. | The primary case. That your retry path backs off and recovers, and that a gateway (LiteLLM/AgentCore) propagates the 503 as retryable rather than collapsing it into a generic error. |
+| **429** | 429 | `ThrottlingException` | Request exceeded an **account quota** (RPM/TPM) or rate limit. Carries `Retry-After`. | That you honour `Retry-After`, throttle your own send rate, and/or request a quota increase path — not that you hammer harder. |
+| **529** | 529 | `overloaded_error` | Model backend temporarily **overloaded** (Anthropic-style); often surfaces to callers as a 503. Guidance pairs it with 503 for retry. | The same retry/backoff path as 503, plus that your client recognises the less-common 529 code. |
+
+Recommended coverage: **always run 503 first** (it is the dominant transient signal and the one customers actually hit), then 429, then 529. 503 and 529 should trigger the same retry/backoff behaviour; 429 should trigger rate-limiting/`Retry-After` behaviour — if your app treats 429 the same as 503 and just retries immediately, that is a finding.
+
+### Rate, latency, and sequencing
+
+- **`fault_rate`** — start low (`0.1`) to observe partial degradation and confirm the healthy fraction still flows, then raise toward `1.0` for a full-outage drill of the pinned placement. `1.0` is the right value to prove a specific error path deterministically; `0.2`–`0.5` is more realistic for a capacity event.
+- **`latency_ms`** — set non-zero (e.g. `2000`–`5000`) to exercise client/gateway **timeouts and cooling-off** before the error returns; leave `0` to test pure error handling. Keep it below your client's timeout if you want the error observed, or above it if you specifically want to trigger timeout handling.
+- **Duration and sequencing between fault types** — the automation runs a single `FaultType` for `DurationSeconds`, then cleanly disables. To rehearse a **worsening or shifting** incident (e.g. 429 → 503 → 529, or escalating rate), chain several `aws:ssm:start-automation-execution` actions in the FIS template with `aws:fis:wait` actions between them, each invoking the automation with a different `FaultType`/`FaultRate` and a `startAfter` on the preceding wait. This mirrors the staged pattern used by `sqs-queue-impairment`. Keep each stage's `DurationSeconds` within the FIS action `maxDuration` (`PT1H`), and size the gaps (`aws:fis:wait`) to let your retries/alarms react between stages.
+
+A single stage is enough for a basic drill. Use the multi-stage chain only when the demo needs to show behaviour as conditions change over time.
+
+## Injector image specification
+
+The injector is a small, single-process HTTP service. Specs for running it on any container runtime:
+
+| Spec | Value |
+|---|---|
+| Base image | `public.ecr.aws/docker/library/python:3.12-slim` |
+| Runtime | Python 3.12, Flask + gunicorn (`gunicorn app:app`) |
+| Listening port | `8080` (override with `PORT`) |
+| Architecture | Build for the architecture you will run on. `linux/arm64` (e.g. Graviton / Fargate ARM) and `linux/amd64` are both supported — build natively for your target; cross-arch emulation is not required. |
+| CPU / memory | 0.25 vCPU / 0.5 GB is ample; it is I/O-bound on the upstream forward. Scale `GUNICORN_WORKERS`/`GUNICORN_THREADS` (defaults 2 / 8) for higher concurrency. |
+| User | Runs as non-root (uid 10001). |
+| Health check | `GET /healthz` → `200` (never faulted, never forwarded). Dockerfile `HEALTHCHECK` already wired. |
+| Status endpoint | `GET /injector-status` → current cached config (active, fault_type, fault_rate, latency_ms, execution_id) for observability. |
+| AWS dependency | Read-only access to its own `/bedrock-fis/{INJECTOR_ID}/*` SSM parameters, via the task/instance role carrying `bedrock-gateway-fault-injection-injector-task-role-iam-policy.json`. Needs a region (`AWS_REGION`/`AWS_DEFAULT_REGION`) for the SSM client. |
+| Fail-open | If SSM is unreachable or `active` is absent/false, every request passes through — the injector can only *add* faults, never cause an outage of its own. |
+| Egress | In `forward` mode, outbound to `UPSTREAM_BASE_URL`. In `echo` mode, none. |
+
+Build and run:
+
+```bash
+cd injector
+# Build natively for your target architecture (example: arm64).
+docker build --platform linux/arm64 -t bedrock-gateway-fault-injector:latest .
+
+docker run -p 8080:8080 \
+  -e INJECTOR_ID=<your-injector-id> \
+  -e AWS_REGION=<your-region> \
+  -e PASSTHROUGH_MODE=forward \
+  -e UPSTREAM_BASE_URL=<the real upstream the gateway would call> \
+  -e RESPONSE_STYLE=aws \
+  bedrock-gateway-fault-injector:latest
+```
+
+Runtime options to pick a host: run it alongside/behind your gateway (ECS/Fargate task, EKS pod, or EC2). A managed public endpoint such as AWS App Runner also works but is not required and provisions more slowly; prefer ECS/Fargate or co-locating with the gateway for predictable start-up.
 
 ## Stop Conditions
 
