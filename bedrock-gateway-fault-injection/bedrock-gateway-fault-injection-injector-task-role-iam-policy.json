@@ -1,0 +1,15 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowInjectorToReadItsOwnParameters",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetParametersByPath",
+                "ssm:GetParameters",
+                "ssm:GetParameter"
+            ],
+            "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:parameter/bedrock-fis/<YOUR INJECTOR ID>/*"
+        }
+    ]
+}

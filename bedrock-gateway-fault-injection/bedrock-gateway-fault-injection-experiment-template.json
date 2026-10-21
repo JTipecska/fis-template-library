@@ -1,0 +1,31 @@
+{
+  "description": "Inject Bedrock-accurate transient errors (503/429/529) into an LLM gateway's upstream calls via a provider-agnostic injector, driven by SSM Parameter Store. Works for self-hosted LiteLLM and AWS-managed AgentCore Gateway without changing the calling application.",
+  "targets": {},
+  "actions": {
+    "injectBedrockGatewayFault": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Toggle the injector into fault mode for a bounded window, with guaranteed rollback",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"InjectorId\": \"<YOUR INJECTOR ID>\", \"FaultType\": \"503\", \"FaultRate\": \"0.5\", \"LatencyMs\": \"0\", \"DurationSeconds\": \"900\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "aws:cloudwatch:alarm",
+      "value": "arn:aws:cloudwatch:<YOUR REGION>:<YOUR AWS ACCOUNT>:alarm:<YOUR APPLICATION ERROR RATE ALARM NAME>"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "BedrockGatewayFaultInjection",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}

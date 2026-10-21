@@ -1,0 +1,171 @@
+schemaVersion: '0.3'
+description: 'Run a bounded Bedrock gateway fault-injection experiment by toggling the injector config in SSM Parameter Store (enable, hold, disable, with rollback). The injector reads /bedrock-fis/{InjectorId}/* and fails OPEN to pass-through when inactive or absent.'
+assumeRole: '{{ AutomationAssumeRole }}'
+
+parameters:
+  InjectorId:
+    type: String
+    description: 'Injector id (used as the /bedrock-fis/{injector_id}/ SSM parameter prefix; must equal the injector container INJECTOR_ID env var)'
+  FaultType:
+    type: String
+    description: 'Which Bedrock-accurate transient error to emit'
+    default: '503'
+    allowedValues:
+      - '503'   # ServiceUnavailableException
+      - '429'   # ThrottlingException
+      - '529'   # overloaded_error
+  FaultRate:
+    type: String
+    description: 'Probability in [0.0, 1.0] that any given request is faulted'
+    default: '0.5'
+  LatencyMs:
+    type: String
+    description: 'Optional artificial delay (milliseconds) applied before the error, to exercise timeouts/cooling-off. 0 disables.'
+    default: '0'
+  DurationSeconds:
+    type: String
+    description: 'How long fault injection stays active before clean disable (integer seconds, >= 1)'
+    default: '900'
+  AutomationAssumeRole:
+    type: String
+    description: 'IAM role ARN for SSM Automation to assume'
+
+mainSteps:
+  # --- Enable: write config first, set active=true LAST so a partially-written
+  #     config is never briefly live. ---
+  - name: SetFaultRate
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/fault_rate'
+      Value: '{{ FaultRate }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetFaultType
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/fault_type'
+      Value: '{{ FaultType }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetLatencyMs
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/latency_ms'
+      Value: '{{ LatencyMs }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetExecutionId
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/execution_id'
+      # FIS does not interpolate its own experiment id into action parameters,
+      # so the SSM Automation execution id is the per-run correlation key. It is
+      # echoed back by the injector in the x-fault-execution-id response header.
+      Value: '{{ automation:EXECUTION_ID }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetActiveLast
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/active'
+      Value: 'true'
+      Type: String
+      Overwrite: true
+
+  # --- Hold for the experiment window. From here, any cancel/failure rolls back. ---
+  - name: HoldExperimentWindow
+    action: 'aws:sleep'
+    onCancel: 'step:DisableInjection'
+    onFailure: 'step:DisableInjection'
+    inputs:
+      Duration: 'PT{{ DurationSeconds }}S'
+
+  # --- Clean disable on the happy path: write active=false FIRST. ---
+  - name: DisableActive
+    action: 'aws:executeAwsApi'
+    onCancel: 'step:DisableInjection'
+    onFailure: 'step:DisableInjection'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/active'
+      Value: 'false'
+      Type: String
+      Overwrite: true
+
+  - name: WaitForCacheTTL
+    action: 'aws:sleep'
+    # Injector SSM cache TTL defaults to 10s; allow a buffer so in-flight
+    # requests observe active=false before parameters are deleted.
+    inputs:
+      Duration: 'PT15S'
+
+  # --- Tidy up on the happy path: delete the parameters so none linger.
+  #     active=false has already been written and observed, and the injector
+  #     treats absent parameters exactly like active=false (fail-open), so this
+  #     is a clean stop from the gateway's view. ---
+  - name: CleanupParameters
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    isEnd: true
+    inputs:
+      Service: ssm
+      Api: DeleteParameters
+      Names:
+        - '/bedrock-fis/{{ InjectorId }}/active'
+        - '/bedrock-fis/{{ InjectorId }}/fault_rate'
+        - '/bedrock-fis/{{ InjectorId }}/fault_type'
+        - '/bedrock-fis/{{ InjectorId }}/latency_ms'
+        - '/bedrock-fis/{{ InjectorId }}/execution_id'
+
+  # --- Rollback handler: reached only via onCancel / onFailure above.
+  #     Writes active=false FIRST (the critical off-switch), then deletes the
+  #     parameters so a cancelled/failed run also leaves a clean slate. ---
+  - name: DisableInjection
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/active'
+      Value: 'false'
+      Type: String
+      Overwrite: true
+
+  - name: CleanupParametersOnRollback
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    isEnd: true
+    inputs:
+      Service: ssm
+      Api: DeleteParameters
+      Names:
+        - '/bedrock-fis/{{ InjectorId }}/active'
+        - '/bedrock-fis/{{ InjectorId }}/fault_rate'
+        - '/bedrock-fis/{{ InjectorId }}/fault_type'
+        - '/bedrock-fis/{{ InjectorId }}/latency_ms'
+        - '/bedrock-fis/{{ InjectorId }}/execution_id'

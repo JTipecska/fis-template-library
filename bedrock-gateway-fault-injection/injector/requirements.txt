@@ -1,0 +1,4 @@
+# Pinned for reproducible builds.
+flask==3.1.0
+gunicorn==23.0.0
+boto3==1.35.76
