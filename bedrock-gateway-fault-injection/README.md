@@ -78,7 +78,7 @@ Point a model deployment's `api_base` at the injector. In `config.yaml`:
 model_list:
   - model_name: bedrock-claude
     litellm_params:
-      model: bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0
+      model: bedrock/anthropic.claude-opus-5-5
       # Normally the Bedrock endpoint; for the experiment, the injector:
       api_base: http://<INJECTOR HOST>:8080
 ```
@@ -104,7 +104,7 @@ aws bedrock-agentcore-control create-gateway \
 #    { "inference": { "provider": {
 #        "endpoint": "https://<INJECTOR PUBLIC HTTPS>/v1",
 #        "operations": [ { "path": "/v1/chat/completions",
-#                          "models": [ { "model": "anthropic.claude-3-5-sonnet-*" } ] } ] } } }
+#                          "models": [ { "model": "anthropic.claude-opus-5-5*" } ] } ] } } }
 #    credential-provider-configurations.json: [ { "credentialProviderType": "GATEWAY_IAM_ROLE" } ]
 aws bedrock-agentcore-control create-gateway-target \
   --gateway-identifier <GATEWAY ID> --name inj-inference-target \
@@ -115,7 +115,7 @@ aws bedrock-agentcore-control create-gateway-target \
 
 The gateway's IAM role needs `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`, and the `bedrock:List*` / `bedrock:Get*` discovery actions it uses to enumerate models from the endpoint on target creation.
 
-> **Verification note (2026-10-21, account 291534835833, us-east-1).** This path was validated against the live `bedrock-agentcore-control` API: a gateway plus an `inference.provider` target with a `GATEWAY_IAM_ROLE` credential provider was created and reached `READY`, with the gateway successfully performing model discovery against the configured endpoint using its IAM role (the target first failed with `403 bedrock:ListFoundationModels` / `ListProvisionedModelThroughputs` until those actions were granted — confirming the gateway really does make the outbound calls the injector would intercept). Pointing the target `endpoint` at a live public-HTTPS injector and observing injected 503/429/529 end-to-end was **not** completed here because it requires the injector published at a public HTTPS endpoint with a valid certificate; the injector's own SSM-driven 503/429/529 behaviour is separately proven (see the injector smoke tests). All test gateway resources were torn down after verification.
+> **Live verification (2026-10-21, account 291534835833, us-east-1).** A dedicated IAM-authorized AgentCore Gateway `bedrock-fis-current-models-wsje0632dh` was created with the `current-model-injector` inference-provider target in `READY` state. The target endpoint is `https://d3t7v6ned5jgkb.cloudfront.net/v1`, backed by the ECS Fargate injector. Signed requests to `https://bedrock-fis-current-models-wsje0632dh.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference/v1/chat/completions` returned the expected faults: `anthropic.claude-opus-5-5` → HTTP 503, `openai.gpt-6.1-sol` → HTTP 429, and `qwen.qwen3-coder-next` → HTTP 529. The gateway, target, Fargate service, CloudFront HTTPS edge, ALB, SSM rules, ECR image, and IAM roles are intentionally still running for Jennifer's testing; do not delete them until she confirms testing is complete.
 
 ## Configure and run the experiment
 
@@ -129,7 +129,7 @@ The gateway's IAM role needs `bedrock:InvokeModel`, `bedrock:InvokeModelWithResp
 
 ## Tuning the fault parameters
 
-The fault is controlled by five SSM parameters under `/bedrock-fis/{InjectorId}/`, which the SSM Automation document writes from its `documentParameters`. You can also set them directly with `aws ssm put-parameter` for ad-hoc testing. The injector re-reads them every `CONFIG_TTL_SECONDS` (default 10), so a change takes effect within one TTL.
+The fault is controlled by six SSM parameters under `/bedrock-fis/{InjectorId}/`, which the SSM Automation document writes from its `documentParameters`. You can also set them directly with `aws ssm put-parameter` for ad-hoc testing. The injector re-reads them every `CONFIG_TTL_SECONDS` (default 10), so a change takes effect within one TTL.
 
 | SSM parameter | `documentParameters` key | Values | Meaning |
 |---|---|---|---|
@@ -137,6 +137,7 @@ The fault is controlled by five SSM parameters under `/bedrock-fis/{InjectorId}/
 | `fault_type` | `FaultType` | `503` \| `429` \| `529` | Which error to emit. |
 | `fault_rate` | `FaultRate` | `0.0`–`1.0` | Probability each request is faulted. |
 | `latency_ms` | `LatencyMs` | integer ≥ 0 | Delay (ms) applied before the error. |
+| `rules` | `Rules` | JSON list | Ordered per-model-family rules; first `model_pattern` match wins. When non-empty, it overrides the flat fault parameters for matched models. |
 | `execution_id` | (set by the automation) | string | Correlation id, echoed in the `x-fault-execution-id` header. |
 
 ### Which error to inject, and when
@@ -157,17 +158,37 @@ Recommended coverage: **always run 503 first** (it is the dominant transient sig
 
 A single stage is enough for a basic drill. Use the multi-stage chain only when the demo needs to show behaviour as conditions change over time.
 
+## Current model examples
+
+The following IDs were selected from a live `aws bedrock list-foundation-models --region us-east-1` query on 2026-10-21. Re-run that query before a future experiment; model availability changes by Region and provider.
+
+| Family | Current example ID | Injector pattern | Suggested fault |
+|---|---|---|---|
+| Claude | `anthropic.claude-opus-5-5` | `anthropic.claude-opus-5-5*` | 503 `ServiceUnavailableException` |
+| Claude | `anthropic.claude-sonnet-5-5` | `anthropic.claude-sonnet-5-5*` | 503 `ServiceUnavailableException` |
+| GPT | `openai.gpt-6.1-sol` | `openai.gpt-6.1-*` | 429 `ThrottlingException` |
+| GPT | `openai.gpt-6-astra` | `openai.gpt-6-astra*` | 429 `ThrottlingException` |
+| Open-weight: Qwen | `qwen.qwen3-coder-next` | `qwen.qwen3-*` | 529 `overloaded_error` + latency |
+| Open-weight: DeepSeek | `deepseek.v3.2` | `deepseek.*` | 529 `overloaded_error` + latency |
+| Open-weight: Meta | `meta.llama4-maverick-17b-instruct-v1:0` | `meta.llama4-*` | 529 `overloaded_error` + latency |
+| Open-weight: Mistral | `mistral.mistral-large-3-675b-instruct` | `mistral.*` | 529 `overloaded_error` + latency |
+
+These are examples for the fault harness, not a claim that every model is enabled for every customer account. Confirm access with the customer's own Bedrock catalog and use inference-profile IDs where the gateway configuration requires them (for example `us.anthropic.claude-opus-4-6-v1` or `us.openai.gpt-6.1-sol`).
+
 ## Per-model-family faults (different HTTP status per model family)
 
 A single running injector can return a **different fault for each model family at the same time**. Instead of (or in addition to) the global `fault_type`/`fault_rate`, write a `rules` parameter holding an ordered JSON list; for each request the injector reads the `model` field (from the JSON body, or the `/model/{id}/invoke` path on the Bedrock native API) and applies the **first rule whose `model_pattern` matches** (case-insensitive glob). A request whose model matches no rule is never faulted.
 
 ```bash
-# anthropic.* -> 503, amazon.nova-* -> 429, *.titan-* -> 529 with 300ms latency, everything else passes through
+# Claude Opus 5.5 -> 503, GPT-6.1 -> 429, Qwen/DeepSeek/Llama 4/Mistral -> 529 with 300ms latency, everything else passes through
 aws ssm put-parameter --name /bedrock-fis/<InjectorId>/active --value true --type String --overwrite
 aws ssm put-parameter --name /bedrock-fis/<InjectorId>/rules --type String --overwrite --value '[
-  {"model_pattern":"anthropic.*",   "fault_type":"503","fault_rate":1.0},
-  {"model_pattern":"amazon.nova-*", "fault_type":"429","fault_rate":1.0},
-  {"model_pattern":"*.titan-*",     "fault_type":"529","fault_rate":1.0,"latency_ms":300}
+  {"model_pattern":"anthropic.claude-opus-5-5*", "fault_type":"503","fault_rate":1.0},
+  {"model_pattern":"openai.gpt-6.1-*",          "fault_type":"429","fault_rate":1.0},
+  {"model_pattern":"qwen.qwen3-*",              "fault_type":"529","fault_rate":1.0,"latency_ms":300},
+  {"model_pattern":"deepseek.*",                "fault_type":"529","fault_rate":1.0,"latency_ms":300},
+  {"model_pattern":"meta.llama4-*",             "fault_type":"529","fault_rate":1.0,"latency_ms":300},
+  {"model_pattern":"mistral.*",                 "fault_type":"529","fault_rate":1.0,"latency_ms":300}
 ]'
 ```
 
@@ -180,7 +201,7 @@ Faulted responses carry `x-fault-model` (the model that was matched) and `x-faul
 Because each rule is scoped to a model-family pattern, several fault campaigns can run **concurrently against the same injector** without interfering — each owns a disjoint slice of model space. Two ways to drive this:
 
 - **One `rules` list, many families (simplest).** Put every family's rule in the single `rules` parameter, as above. The injector evaluates all of them per request. This is one experiment that faults several families differently at once.
-- **Several FIS experiments / SSM writers in parallel.** Give each team or experiment its **own injector** (its own `InjectorId` ⇒ its own `/bedrock-fis/{InjectorId}/*` subtree and its own gateway wiring), and run their FIS experiments simultaneously. Experiment A faults `anthropic.*` with 503 while experiment B faults `amazon.nova-*` with 429, each with independent start/stop/duration and its own stop-condition alarm. Use separate injectors (not one shared `rules` key) when the campaigns must start and stop independently, since concurrent writers to a single `rules` parameter would overwrite each other.
+- **Several FIS experiments / SSM writers in parallel.** Give each team or experiment its **own injector** (its own `InjectorId` ⇒ its own `/bedrock-fis/{InjectorId}/*` subtree and its own gateway wiring), and run their FIS experiments simultaneously. Experiment A faults `anthropic.claude-opus-5-5*` with 503 while experiment B faults `openai.gpt-6.1-*` with 429, each with independent start/stop/duration and its own stop-condition alarm. Use separate injectors (not one shared `rules` key) when the campaigns must start and stop independently, since concurrent writers to a single `rules` parameter would overwrite each other.
 
 The demo value: show a multi-model application degrade **asymmetrically** — e.g. Claude traffic throws 503 and should fail over to a second profile, while Nova traffic throws 429 and should back off — proving each path's resilience independently and at the same time.
 
@@ -191,15 +212,19 @@ The injector has to be reachable by whatever calls it:
 - For **LiteLLM self-hosted**, the injector only needs to be reachable from the LiteLLM process (same VPC/host is fine; no public exposure required).
 - For **AgentCore Gateway**, the inference-target `endpoint` must be an `https://` URL the managed gateway can reach from the AWS network — in practice a **public HTTPS endpoint with a valid certificate**.
 
-In the ECS Fargate reference setup, the public endpoint is an **Application Load Balancer (ALB)**:
+In the live ECS Fargate reference setup, the public endpoint is an AWS-managed **CloudFront HTTPS edge** in front of an internet-facing ALB:
 
-- The ALB is `internet-facing` in two public subnets, listening on port 80 (add an HTTPS :443 listener with an ACM certificate for the AgentCore case, which requires `https://`).
-- Its security group allows inbound from the callers you intend (in a locked-down drill, scope it to the gateway's egress rather than `0.0.0.0/0`).
-- It forwards to an **IP target group** on container port 8080; ECS registers each Fargate task IP automatically.
+- **Live HTTPS endpoint:** `https://d3t7v6ned5jgkb.cloudfront.net`.
+- CloudFront uses its default AWS-managed `*.cloudfront.net` certificate, so AgentCore can connect with normal public TLS validation without a customer domain.
+- CloudFront forwards POST requests and request bodies to the ALB with caching disabled; the injector's model-specific status is never cached.
+- The ALB remains the origin on port 80, but its security group accepts port 80 only from the AWS-managed CloudFront origin-facing prefix list. The raw ALB DNS name is no longer the intended public entry point.
+- The ALB forwards to an **IP target group** on container port 8080; ECS registers each Fargate task IP automatically.
 - Target health is the injector's `GET /healthz` (always 200, never faulted), so the ALB only routes to live tasks.
-- The Fargate tasks run in the same subnets with a security group that accepts traffic **only from the ALB security group** on 8080 — the tasks are not directly reachable, only via the ALB.
+- The Fargate tasks run in the same subnets with a security group that accepts traffic only from the ALB security group on 8080.
 
-So the "public endpoint" is the ALB DNS name (e.g. `http://<name>.<region>.elb.amazonaws.com`); callers and gateways hit that, the ALB spreads traffic across healthy injector tasks, and the tasks read their per-family rules from SSM. This is why ECS Fargate + ALB is the recommended host over App Runner: the ALB gives a stable public endpoint you control (and can put a real cert on), task start-up is fast and transparent, and you can scale the task count behind the one endpoint.
+A true ALB `:443` listener with an ACM public certificate still requires a domain you control; this account has no registered domain, Route 53 hosted zone, or issued ACM certificate. The CloudFront default HTTPS hostname is the working interim endpoint for AgentCore and provides equivalent public TLS termination without inventing or guessing a domain. If Jennifer supplies a domain later, add DNS validation, request an ACM certificate in `us-east-1`, attach it to an ALB `:443` listener, then optionally keep CloudFront as the edge.
+
+The live AgentCore target uses `https://d3t7v6ned5jgkb.cloudfront.net/v1` as its provider endpoint. The gateway itself is invoked at `https://bedrock-fis-current-models-wsje0632dh.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference/v1/chat/completions` with AWS SigV4 (`bedrock-agentcore`) authentication. This is why ECS Fargate plus ALB plus CloudFront is preferable to App Runner here: task startup is predictable, the edge hostname has managed HTTPS, and the origin/task boundaries are explicit.
 
 ## Injector image specification
 
@@ -235,7 +260,7 @@ docker run -p 8080:8080 \
   bedrock-gateway-fault-injector:latest
 ```
 
-Runtime options to pick a host: run it alongside/behind your gateway (ECS/Fargate task, EKS pod, or EC2). A managed public endpoint such as AWS App Runner also works but is not required and provisions more slowly; prefer ECS/Fargate or co-locating with the gateway for predictable start-up.
+Runtime options to pick a host: run it alongside/behind your gateway (ECS/Fargate task, EKS pod, or EC2). Prefer ECS/Fargate for a predictable managed container runtime and stable ALB/CloudFront endpoint; co-locating with the gateway is also appropriate for private LiteLLM deployments.
 
 ## Stop Conditions
 
