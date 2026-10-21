@@ -41,6 +41,7 @@ import logging
 import os
 import random
 import time
+import fnmatch
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -135,6 +136,25 @@ def _error_body(fault_type: str, response_style: str) -> tuple[str, str]:
 # Cached, fail-open SSM-driven configuration
 # ---------------------------------------------------------------------------
 @dataclass
+class FaultRule:
+    """One fault rule scoped to a model-family pattern.
+
+    Attributes:
+        model_pattern: A glob matched against the request's ``model`` field
+            (e.g. ``anthropic.*``, ``amazon.nova-*``, ``*.claude-3-5-*``, ``*``).
+            Matching is case-insensitive via ``fnmatch``.
+        fault_type: One of ``"503" | "429" | "529"``.
+        fault_rate: Probability in ``[0.0, 1.0]`` a matching request is faulted.
+        latency_ms: Optional delay (ms) before the error for matching requests.
+    """
+
+    model_pattern: str
+    fault_type: str
+    fault_rate: float
+    latency_ms: int = 0
+
+
+@dataclass
 class InjectorConfig:
     """A cached snapshot of the injector configuration for one injector id.
 
@@ -142,12 +162,26 @@ class InjectorConfig:
     inactive, no fault rate. Produced from the ``/bedrock-fis/{injector_id}/*``
     SSM parameters.
 
+    Two control modes, both read from SSM and both honoured:
+
+    - **Per-model-family rules** (preferred): the ``rules`` parameter holds a
+      JSON list of ``{model_pattern, fault_type, fault_rate, latency_ms}``. For
+      each request the injector reads the ``model`` field from the body and
+      applies the FIRST rule whose ``model_pattern`` matches. This is what lets
+      one running injector return different HTTP statuses for different model
+      families at the same time, and lets several parallel experiments each own
+      a different family's rule.
+    - **Global single rule** (backward-compatible fallback): if ``rules`` is
+      absent, the flat ``fault_type`` / ``fault_rate`` / ``latency_ms``
+      parameters apply to every request regardless of model.
+
     Attributes:
         active: Whether fault injection is active for this snapshot.
-        fault_rate: Probability in ``[0.0, 1.0]`` that a request is faulted.
-        fault_type: One of ``"503" | "429" | "529"``.
-        latency_ms: Optional artificial delay (ms) applied before the error, to
-            exercise client/gateway timeouts and cooling-off behaviour.
+        fault_rate: Global fallback probability in ``[0.0, 1.0]``.
+        fault_type: Global fallback fault type (``"503" | "429" | "529"``).
+        latency_ms: Global fallback artificial delay (ms) before the error.
+        rules: Ordered per-model-family rules; first match wins. Empty => use
+            the global fallback.
         execution_id: SSM Automation execution id, for per-run correlation.
         fetched_at: ``time.monotonic()`` when this snapshot was fetched.
     """
@@ -156,6 +190,7 @@ class InjectorConfig:
     fault_rate: float = 0.0
     fault_type: str = "503"
     latency_ms: int = 0
+    rules: tuple[FaultRule, ...] = ()
     execution_id: str = ""
     fetched_at: float = 0.0
 
@@ -163,6 +198,24 @@ class InjectorConfig:
     def passthrough(cls, fetched_at: Optional[float] = None) -> "InjectorConfig":
         """Return the fail-open pass-through configuration."""
         return cls(fetched_at=time.monotonic() if fetched_at is None else fetched_at)
+
+    def match(self, model: str) -> Optional[FaultRule]:
+        """Return the effective fault rule for a given model id, or ``None``.
+
+        If ``rules`` is set, returns the first rule whose ``model_pattern``
+        matches ``model`` (case-insensitive glob); no match => ``None`` (that
+        request is not faulted). If ``rules`` is empty, falls back to the global
+        single rule as a synthetic ``*`` rule. A ``fault_rate`` of 0 yields a
+        rule that never fires, which ``proxy`` handles.
+        """
+        if self.rules:
+            ml = (model or "").lower()
+            for r in self.rules:
+                if fnmatch.fnmatch(ml, r.model_pattern.lower()):
+                    return r
+            return None
+        # Backward-compatible global fallback as a catch-all rule.
+        return FaultRule("*", self.fault_type, self.fault_rate, self.latency_ms)
 
 
 class SSMConfigLoader:
@@ -236,11 +289,38 @@ class SSMConfigLoader:
         if latency_ms < 0:
             raise ValueError(f"latency_ms must be >= 0: {latency_ms}")
 
+        # Optional per-model-family rules. JSON list of objects:
+        #   [{"model_pattern":"anthropic.*","fault_type":"503","fault_rate":1.0,"latency_ms":0}, ...]
+        # First match wins. Absent/empty => global single-rule fallback.
+        rules: tuple[FaultRule, ...] = ()
+        rules_raw = params.get("rules", "").strip()
+        if rules_raw:
+            parsed = json.loads(rules_raw)
+            if not isinstance(parsed, list):
+                raise ValueError("rules must be a JSON list")
+            built = []
+            for i, r in enumerate(parsed):
+                if not isinstance(r, dict):
+                    raise ValueError(f"rules[{i}] must be an object")
+                mp = str(r["model_pattern"])
+                ft = str(r["fault_type"]).strip()
+                if ft not in VALID_FAULT_TYPES:
+                    raise ValueError(f"rules[{i}].fault_type must be one of {sorted(VALID_FAULT_TYPES)}: {ft}")
+                fr = float(r.get("fault_rate", 1.0))
+                if not (0.0 <= fr <= 1.0):
+                    raise ValueError(f"rules[{i}].fault_rate out of range [0.0, 1.0]: {fr}")
+                lm = int(r.get("latency_ms", 0))
+                if lm < 0:
+                    raise ValueError(f"rules[{i}].latency_ms must be >= 0: {lm}")
+                built.append(FaultRule(mp, ft, fr, lm))
+            rules = tuple(built)
+
         return InjectorConfig(
             active=active,
             fault_rate=fault_rate,
             fault_type=fault_type,
             latency_ms=latency_ms,
+            rules=rules,
             execution_id=params.get("execution_id", ""),
             fetched_at=fetched_at,
         )
@@ -284,6 +364,39 @@ def _forward_upstream(upstream_base: str, path: str, timeout: float) -> Response
         # sees a transient error rather than a hang.
         body_json, ctype = _error_body("503", os.environ.get("RESPONSE_STYLE", "aws"))
         return Response(body_json, status=503, content_type=ctype)
+
+
+def _extract_model(path: str) -> str:
+    """Best-effort extract the model id from the current request.
+
+    Looks in the JSON body ``model`` field first (OpenAI-compatible chat and
+    Bedrock Converse both carry it), then falls back to the URL path, which for
+    the Bedrock native API is ``/model/{modelId}/invoke`` (the id is the segment
+    after ``model/``, URL-decoded).
+
+    Returns an empty string if no model can be determined, which only matters
+    when per-model rules are configured (an empty model matches only a ``*``).
+    """
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            # Fall back to parsing the raw body as JSON regardless of the
+            # Content-Type header (some clients omit application/json).
+            raw = request.get_data(cache=True)
+            if raw:
+                data = json.loads(raw)
+        if isinstance(data, dict) and data.get("model"):
+            return str(data["model"])
+    except Exception:
+        pass
+    import urllib.parse as _up
+
+    parts = path.split("/")
+    if "model" in parts:
+        idx = parts.index("model")
+        if idx + 1 < len(parts):
+            return _up.unquote(parts[idx + 1])
+    return ""
 
 
 def _echo_success(response_style: str) -> Response:
@@ -350,6 +463,15 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
                     "fault_rate": cfg.fault_rate,
                     "fault_type": cfg.fault_type,
                     "latency_ms": cfg.latency_ms,
+                    "rules": [
+                        {
+                            "model_pattern": r.model_pattern,
+                            "fault_type": r.fault_type,
+                            "fault_rate": r.fault_rate,
+                            "latency_ms": r.latency_ms,
+                        }
+                        for r in cfg.rules
+                    ],
                     "execution_id": cfg.execution_id,
                     "passthrough_mode": passthrough_mode,
                     "response_style": response_style,
@@ -362,27 +484,43 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
     @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def proxy(path: str) -> Response:
-        """Main proxy entrypoint: fault a sampled share, pass the rest through."""
+        """Main proxy entrypoint: fault a sampled share, pass the rest through.
+
+        When per-model-family rules are configured, the effective fault_type /
+        fault_rate / latency_ms are chosen by matching the request's model id
+        against the rules (first match wins); a request whose model matches no
+        rule is never faulted.
+        """
         cfg = loader.get()
 
-        faulted = False
-        if cfg.active and cfg.fault_rate > 0.0:
-            # Strict "<" so fault_rate=0 never selects and 1.0 always selects.
-            faulted = random.random() < cfg.fault_rate
+        rule = None
+        model = ""
+        if cfg.active:
+            model = _extract_model(path)
+            rule = cfg.match(model)
 
-        if faulted:
-            if cfg.latency_ms > 0:
-                time.sleep(cfg.latency_ms / 1000.0)
-            shape = FAULT_SHAPES[cfg.fault_type]
-            body_json, ctype = _error_body(cfg.fault_type, response_style)
+        faulted = False
+        if rule is not None and rule.fault_rate > 0.0:
+            # Strict "<" so fault_rate=0 never selects and 1.0 always selects.
+            faulted = random.random() < rule.fault_rate
+
+        if faulted and rule is not None:
+            if rule.latency_ms > 0:
+                time.sleep(rule.latency_ms / 1000.0)
+            shape = FAULT_SHAPES[rule.fault_type]
+            body_json, ctype = _error_body(rule.fault_type, response_style)
             resp = Response(body_json, status=shape["http_status"], content_type=ctype)
             for hk, hv in shape["headers"].items():
                 resp.headers[hk] = hv
-            resp.headers["x-fault-injected"] = cfg.fault_type
+            resp.headers["x-fault-injected"] = rule.fault_type
+            resp.headers["x-fault-model"] = model
+            resp.headers["x-fault-matched-pattern"] = rule.model_pattern
             resp.headers["x-fault-execution-id"] = cfg.execution_id
             logger.info(
-                "fault_injected type=%s execution=%s path=/%s",
-                cfg.fault_type,
+                "fault_injected type=%s model=%s pattern=%s execution=%s path=/%s",
+                rule.fault_type,
+                model,
+                rule.model_pattern,
                 cfg.execution_id,
                 path,
             )

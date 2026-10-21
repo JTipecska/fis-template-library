@@ -22,6 +22,10 @@ parameters:
     type: String
     description: 'Optional artificial delay (milliseconds) applied before the error, to exercise timeouts/cooling-off. 0 disables.'
     default: '0'
+  Rules:
+    type: String
+    description: 'Optional per-model-family rules as a JSON list [{"model_pattern","fault_type","fault_rate","latency_ms"}], first match wins. When non-empty it overrides the flat FaultType/FaultRate/LatencyMs for matched models. Default empty string = use the flat global fault.'
+    default: ''
   DurationSeconds:
     type: String
     description: 'How long fault injection stays active before clean disable (integer seconds, >= 1)'
@@ -66,6 +70,21 @@ mainSteps:
       Api: PutParameter
       Name: '/bedrock-fis/{{ InjectorId }}/latency_ms'
       Value: '{{ LatencyMs }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetRules
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    # Per-model-family rules (JSON list). When empty the injector falls back to
+    # the flat FaultType/FaultRate above. Written as an empty string by default,
+    # which the injector treats as "no rules".
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/rules'
+      Value: '{{ Rules }}'
       Type: String
       Overwrite: true
 
@@ -140,6 +159,7 @@ mainSteps:
         - '/bedrock-fis/{{ InjectorId }}/fault_rate'
         - '/bedrock-fis/{{ InjectorId }}/fault_type'
         - '/bedrock-fis/{{ InjectorId }}/latency_ms'
+        - '/bedrock-fis/{{ InjectorId }}/rules'
         - '/bedrock-fis/{{ InjectorId }}/execution_id'
 
   # --- Rollback handler: reached only via onCancel / onFailure above.
@@ -168,4 +188,5 @@ mainSteps:
         - '/bedrock-fis/{{ InjectorId }}/fault_rate'
         - '/bedrock-fis/{{ InjectorId }}/fault_type'
         - '/bedrock-fis/{{ InjectorId }}/latency_ms'
+        - '/bedrock-fis/{{ InjectorId }}/rules'
         - '/bedrock-fis/{{ InjectorId }}/execution_id'

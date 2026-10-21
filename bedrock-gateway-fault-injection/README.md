@@ -157,6 +157,50 @@ Recommended coverage: **always run 503 first** (it is the dominant transient sig
 
 A single stage is enough for a basic drill. Use the multi-stage chain only when the demo needs to show behaviour as conditions change over time.
 
+## Per-model-family faults (different HTTP status per model family)
+
+A single running injector can return a **different fault for each model family at the same time**. Instead of (or in addition to) the global `fault_type`/`fault_rate`, write a `rules` parameter holding an ordered JSON list; for each request the injector reads the `model` field (from the JSON body, or the `/model/{id}/invoke` path on the Bedrock native API) and applies the **first rule whose `model_pattern` matches** (case-insensitive glob). A request whose model matches no rule is never faulted.
+
+```bash
+# anthropic.* -> 503, amazon.nova-* -> 429, *.titan-* -> 529 with 300ms latency, everything else passes through
+aws ssm put-parameter --name /bedrock-fis/<InjectorId>/active --value true --type String --overwrite
+aws ssm put-parameter --name /bedrock-fis/<InjectorId>/rules --type String --overwrite --value '[
+  {"model_pattern":"anthropic.*",   "fault_type":"503","fault_rate":1.0},
+  {"model_pattern":"amazon.nova-*", "fault_type":"429","fault_rate":1.0},
+  {"model_pattern":"*.titan-*",     "fault_type":"529","fault_rate":1.0,"latency_ms":300}
+]'
+```
+
+Each rule field: `model_pattern` (glob, required), `fault_type` (`503`/`429`/`529`, required), `fault_rate` (`0.0`–`1.0`, default `1.0`), `latency_ms` (default `0`). First match wins, so order from most specific to most general and put a trailing `{"model_pattern":"*", ...}` only if you want a catch-all.
+
+Faulted responses carry `x-fault-model` (the model that was matched) and `x-fault-matched-pattern` (which rule fired) headers, alongside `x-fault-injected` and `x-fault-execution-id`, so you can see exactly why each request was faulted. If `rules` is absent, the injector uses the flat global `fault_type`/`fault_rate` for all models (backward compatible). `GET /injector-status` echoes the active rule set.
+
+### Multiple parallel executions
+
+Because each rule is scoped to a model-family pattern, several fault campaigns can run **concurrently against the same injector** without interfering — each owns a disjoint slice of model space. Two ways to drive this:
+
+- **One `rules` list, many families (simplest).** Put every family's rule in the single `rules` parameter, as above. The injector evaluates all of them per request. This is one experiment that faults several families differently at once.
+- **Several FIS experiments / SSM writers in parallel.** Give each team or experiment its **own injector** (its own `InjectorId` ⇒ its own `/bedrock-fis/{InjectorId}/*` subtree and its own gateway wiring), and run their FIS experiments simultaneously. Experiment A faults `anthropic.*` with 503 while experiment B faults `amazon.nova-*` with 429, each with independent start/stop/duration and its own stop-condition alarm. Use separate injectors (not one shared `rules` key) when the campaigns must start and stop independently, since concurrent writers to a single `rules` parameter would overwrite each other.
+
+The demo value: show a multi-model application degrade **asymmetrically** — e.g. Claude traffic throws 503 and should fail over to a second profile, while Nova traffic throws 429 and should back off — proving each path's resilience independently and at the same time.
+
+## The public endpoint
+
+The injector has to be reachable by whatever calls it:
+
+- For **LiteLLM self-hosted**, the injector only needs to be reachable from the LiteLLM process (same VPC/host is fine; no public exposure required).
+- For **AgentCore Gateway**, the inference-target `endpoint` must be an `https://` URL the managed gateway can reach from the AWS network — in practice a **public HTTPS endpoint with a valid certificate**.
+
+In the ECS Fargate reference setup, the public endpoint is an **Application Load Balancer (ALB)**:
+
+- The ALB is `internet-facing` in two public subnets, listening on port 80 (add an HTTPS :443 listener with an ACM certificate for the AgentCore case, which requires `https://`).
+- Its security group allows inbound from the callers you intend (in a locked-down drill, scope it to the gateway's egress rather than `0.0.0.0/0`).
+- It forwards to an **IP target group** on container port 8080; ECS registers each Fargate task IP automatically.
+- Target health is the injector's `GET /healthz` (always 200, never faulted), so the ALB only routes to live tasks.
+- The Fargate tasks run in the same subnets with a security group that accepts traffic **only from the ALB security group** on 8080 — the tasks are not directly reachable, only via the ALB.
+
+So the "public endpoint" is the ALB DNS name (e.g. `http://<name>.<region>.elb.amazonaws.com`); callers and gateways hit that, the ALB spreads traffic across healthy injector tasks, and the tasks read their per-family rules from SSM. This is why ECS Fargate + ALB is the recommended host over App Runner: the ALB gives a stable public endpoint you control (and can put a real cert on), task start-up is fast and transparent, and you can scale the task count behind the one endpoint.
+
 ## Injector image specification
 
 The injector is a small, single-process HTTP service. Specs for running it on any container runtime:
