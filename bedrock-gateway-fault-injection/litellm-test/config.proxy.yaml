@@ -1,0 +1,9 @@
+# Temporary fault-proxy configuration.
+# The application continues to request model_name=bedrock-test.
+# Replace the endpoint and keep FAULT_PROXY_API_KEY in the runtime secret store.
+model_list:
+  - model_name: bedrock-test
+    litellm_params:
+      model: openai/<BEDROCK_MODEL_ID>
+      api_base: https://<PROXY HTTPS ENDPOINT>/v1
+      api_key: os.environ/FAULT_PROXY_API_KEY

@@ -1,0 +1,26 @@
+services:
+  fault-proxy:
+    build:
+      context: ../injector
+    environment:
+      INJECTOR_ID: local-litellm
+      PASSTHROUGH_MODE: echo
+      RESPONSE_STYLE: openai
+      INBOUND_AUTH_MODE: bearer
+      PROXY_API_KEY: ${FAULT_PROXY_API_KEY:?set FAULT_PROXY_API_KEY}
+      MODEL_IDS: <BEDROCK_MODEL_ID>
+    ports:
+      - "8080"
+
+  litellm:
+    image: ${LITELLM_IMAGE:?set a pinned LiteLLM image tag}
+    depends_on:
+      - fault-proxy
+    command: ["--config", "/app/config.proxy.local.yaml", "--port", "4000"]
+    environment:
+      FAULT_PROXY_API_KEY: ${FAULT_PROXY_API_KEY:?set FAULT_PROXY_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY}
+    volumes:
+      - ./config.proxy.local.yaml:/app/config.proxy.local.yaml:ro
+    ports:
+      - "4000:4000"

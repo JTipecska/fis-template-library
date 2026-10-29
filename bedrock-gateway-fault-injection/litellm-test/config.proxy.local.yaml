@@ -1,0 +1,7 @@
+# Local-only Compose config. The proxy is deliberately in echo mode.
+model_list:
+  - model_name: bedrock-test
+    litellm_params:
+      model: openai/bedrock-test
+      api_base: http://fault-proxy:8080/v1
+      api_key: os.environ/FAULT_PROXY_API_KEY

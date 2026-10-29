@@ -17,9 +17,14 @@ document toggles on and off with guaranteed rollback. Every request is a
 pass-through no-op until SSM reports ``active=true``.
 
 Two forwarding sub-designs are supported for pass-through (non-faulted) traffic:
-- ``PASSTHROUGH_MODE=forward`` (default): proxy the request unchanged to
-  ``UPSTREAM_BASE_URL`` and stream the response back. Use when this injector sits
-  in front of a real upstream (the gateway's true Bedrock/OpenAI endpoint).
+- ``PASSTHROUGH_MODE=forward`` (default): proxy the request to
+  ``UPSTREAM_BASE_URL`` and relay the response. Use ``UPSTREAM_AUTH_MODE=passthrough``
+  for a LiteLLM/non-AWS upstream, or ``UPSTREAM_AUTH_MODE=sigv4`` for Bedrock so
+  the injector task role signs a new request for the Bedrock URL.
+- ``BEDROCK_API_MODE=converse``: call Bedrock Runtime Converse with the injector
+  task role and translate the result to the OpenAI-compatible response expected
+  by an AgentCore inference-provider target. This supports current inference
+  profile IDs that the Bedrock OpenAI-compatible endpoint may reject.
 - ``PASSTHROUGH_MODE=echo``: do not forward; return a minimal synthetic success.
   Use for a pure fault-drill harness with no real upstream wired, or when the
   gateway itself already owns the real call and this injector is only ever meant
@@ -36,12 +41,13 @@ lazily on first config read.
 
 from __future__ import annotations
 
+import fnmatch
+import hmac
 import json
 import logging
 import os
 import random
 import time
-import fnmatch
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -138,10 +144,9 @@ def _error_body(fault_type: str, response_style: str) -> tuple[str, str]:
 @dataclass
 class FaultRule:
     """One fault rule scoped to a model-family pattern.
-
     Attributes:
         model_pattern: A glob matched against the request's ``model`` field
-            (e.g. ``anthropic.*``, ``amazon.nova-*``, ``*.claude-3-5-*``, ``*``).
+            (e.g. ``anthropic.*``, ``openai.gpt-6.*``, ``qwen.qwen3-*``, ``*``).
             Matching is case-insensitive via ``fnmatch``.
         fault_type: One of ``"503" | "429" | "529"``.
         fault_rate: Probability in ``[0.0, 1.0]`` a matching request is faulted.
@@ -329,24 +334,177 @@ class SSMConfigLoader:
 # ---------------------------------------------------------------------------
 # Forwarding (pass-through) of non-faulted requests
 # ---------------------------------------------------------------------------
-def _forward_upstream(upstream_base: str, path: str, timeout: float) -> Response:
-    """Forward the current request unchanged to the real upstream and relay the response.
+def _message_content_blocks(value: Any) -> list[dict[str, str]]:
+    """Translate OpenAI message content into Bedrock Converse text blocks."""
+    if isinstance(value, str):
+        return [{"text": value}]
+    if isinstance(value, list):
+        blocks = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                blocks.append({"text": str(item["text"])})
+        return blocks
+    return []
 
-    Preserves method, path, query string, body and headers (minus hop-by-hop and
-    Host, which are set for the upstream connection). This keeps any upstream
-    SigV4/bearer auth that the gateway already applied intact, because the body
-    and signed headers are passed through byte-for-byte.
+
+def _forward_bedrock_converse(model: str, timeout: float, region: str) -> Response:
+    """Call Bedrock Converse and translate its response to OpenAI chat format.
+
+    AgentCore inference-provider targets send OpenAI-compatible requests. Current
+    Claude and GPT inference profiles are callable through Bedrock Converse even
+    when the Bedrock OpenAI-compatible endpoint rejects their model IDs, so this
+    adapter keeps the application and AgentCore contract unchanged.
+    """
+    import boto3
+    from botocore.exceptions import ClientError
+
+    try:
+        payload = request.get_json(silent=True) or json.loads(request.get_data(cache=True) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        messages = []
+        system = []
+        for item in payload.get("messages", []):
+            if not isinstance(item, dict):
+                continue
+            blocks = _message_content_blocks(item.get("content"))
+            if not blocks:
+                continue
+            if item.get("role") == "system":
+                system.extend(blocks)
+            elif item.get("role") in ("user", "assistant"):
+                messages.append({"role": item["role"], "content": blocks})
+        if not messages:
+            raise ValueError("messages must contain at least one user or assistant message")
+
+        inference_config = {}
+        max_tokens = payload.get("max_tokens", payload.get("max_completion_tokens"))
+        if max_tokens is not None:
+            inference_config["maxTokens"] = int(max_tokens)
+        if payload.get("temperature") is not None:
+            inference_config["temperature"] = float(payload["temperature"])
+        if payload.get("top_p") is not None:
+            inference_config["topP"] = float(payload["top_p"])
+        stop = payload.get("stop")
+        if isinstance(stop, str):
+            inference_config["stopSequences"] = [stop]
+        elif isinstance(stop, list):
+            inference_config["stopSequences"] = [str(value) for value in stop]
+
+        kwargs: dict[str, Any] = {"modelId": model, "messages": messages}
+        if system:
+            kwargs["system"] = system
+        if inference_config:
+            kwargs["inferenceConfig"] = inference_config
+
+        client = boto3.client("bedrock-runtime", region_name=region or os.environ.get("AWS_REGION"))
+        result = client.converse(**kwargs)
+        output_message = result.get("output", {}).get("message", {})
+        content = "".join(
+            str(block.get("text", ""))
+            for block in output_message.get("content", [])
+            if isinstance(block, dict) and block.get("text") is not None
+        )
+        stop_reason = result.get("stopReason", "")
+        finish_reason = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length"}.get(
+            stop_reason, stop_reason or "stop"
+        )
+        usage = result.get("usage", {})
+        body = {
+            "id": f"chatcmpl-bedrock-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("inputTokens", 0),
+                "completion_tokens": usage.get("outputTokens", 0),
+                "total_tokens": usage.get("totalTokens", 0),
+            },
+        }
+        return Response(json.dumps(body), status=200, content_type="application/json")
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 502))
+        body = {"error": {
+            "message": error.get("Message", str(exc)),
+            "type": error.get("Code", "BedrockError"),
+            "code": error.get("Code", "BedrockError"),
+            "param": None,
+        }}
+        return Response(json.dumps(body), status=status, content_type="application/json")
+    except Exception as exc:
+        logger.warning("bedrock_converse_failed model=%s", model, exc_info=True)
+        body = {"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_request_error", "param": None}}
+        return Response(json.dumps(body), status=400, content_type="application/json")
+
+
+def _sign_upstream_request(
+    url: str,
+    body: bytes,
+    method: str,
+    headers: dict[str, str],
+    service: str,
+    region: str,
+) -> dict[str, str]:
+    """Sign a new AWS upstream request with the injector task role."""
+    import boto3
+    from botocore.awsrequest import AWSRequest
+    from botocore.auth import SigV4Auth
+
+    credentials = boto3.Session().get_credentials()
+    if credentials is None:
+        raise RuntimeError("No AWS credentials available for upstream SigV4 signing")
+    if not region:
+        raise RuntimeError("UPSTREAM_SIGV4_REGION or AWS_REGION is required for SigV4 signing")
+    aws_request = AWSRequest(method=method, url=url, data=body, headers=headers)
+    SigV4Auth(credentials, service, region).add_auth(aws_request)
+    return dict(aws_request.headers)
+
+
+def _forward_upstream(
+    upstream_base: str,
+    path: str,
+    timeout: float,
+    auth_mode: str,
+    sigv4_service: str,
+    sigv4_region: str,
+) -> Response:
+    """Forward the current request and relay the upstream response.
+
+    ``passthrough`` preserves auth for a LiteLLM/non-AWS upstream. ``sigv4``
+    removes AgentCore's inbound signature and signs the new URL with the ECS
+    task role, which is required for Amazon Bedrock.
     """
     url = upstream_base.rstrip("/") + path
     if request.query_string:
         url = f"{url}?{request.query_string.decode('utf-8')}"
 
-    # Strip hop-by-hop headers and Host; everything else (incl. Authorization /
-    # x-amz-* signing headers the gateway set) is forwarded untouched.
-    skip = {"host", "content-length", "connection", "keep-alive", "transfer-encoding"}
+    # Strip hop-by-hop headers, Host, and the inbound signature. The inbound
+    # AgentCore signature covers the injector URL, not the Bedrock URL.
+    skip = {
+        "host", "content-length", "connection", "keep-alive", "transfer-encoding",
+        "authorization", "x-amz-date", "x-amz-security-token",
+        "x-amz-content-sha256", "x-amz-target",
+    }
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
 
     body = request.get_data()
+    if auth_mode == "sigv4":
+        # Do not sign CloudFront/ALB forwarding headers. They are edge metadata,
+        # not part of the application request and can change across hops.
+        signable = {"content-type", "accept"}
+        fwd_headers = {k: v for k, v in fwd_headers.items() if k.lower() in signable}
+        fwd_headers = _sign_upstream_request(
+            url, body, request.method, fwd_headers, sigv4_service, sigv4_region
+        )
+    elif auth_mode != "passthrough":
+        raise ValueError(f"UPSTREAM_AUTH_MODE must be passthrough or sigv4: {auth_mode}")
+
     req = urllib.request.Request(url, data=body, headers=fwd_headers, method=request.method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as upstream_resp:
@@ -418,6 +576,17 @@ def _echo_success(response_style: str) -> Response:
     return Response(json.dumps(body), status=200, content_type="application/json")
 
 
+def _unauthorized_response() -> Response:
+    """Return a generic bearer-auth failure without exposing configuration."""
+    response = Response(
+        json.dumps({"error": {"message": "authentication required", "type": "authentication_error"}}),
+        status=401,
+        content_type="application/json",
+    )
+    response.headers["WWW-Authenticate"] = "Bearer"
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Flask application factory
 # ---------------------------------------------------------------------------
@@ -428,10 +597,19 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
         INJECTOR_ID      : scopes the /bedrock-fis/{injector_id}/ SSM subtree. Required.
         UPSTREAM_BASE_URL: real upstream to forward pass-through traffic to
                            (required when PASSTHROUGH_MODE=forward).
+        UPSTREAM_AUTH_MODE: "passthrough" (default) or "sigv4" for AWS upstreams.
+        BEDROCK_API_MODE: "openai" (default) forwards to UPSTREAM_BASE_URL, or
+                           "converse" calls Bedrock Runtime Converse and translates
+                           the result to the OpenAI-compatible response style.
+        UPSTREAM_SIGV4_SERVICE: AWS SigV4 service name (default "bedrock").
+        UPSTREAM_SIGV4_REGION: AWS signing Region (defaults to AWS_REGION).
         PASSTHROUGH_MODE : "forward" (default) | "echo".
         RESPONSE_STYLE   : "aws" (default) | "openai" — error/echo envelope shape.
         CONFIG_TTL_SECONDS: SSM cache TTL (default 10).
         UPSTREAM_TIMEOUT : upstream forward timeout seconds (default 60).
+        MODEL_IDS        : comma-separated model ids returned by /v1/models for AgentCore discovery.
+        INBOUND_AUTH_MODE: "none" (default) or "bearer" for LiteLLM-to-proxy authentication.
+        PROXY_API_KEY    : expected bearer token when INBOUND_AUTH_MODE=bearer; store in a secret.
     """
     app = Flask(__name__)
 
@@ -439,22 +617,67 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
     passthrough_mode = os.environ.get("PASSTHROUGH_MODE", "forward").strip().lower()
     response_style = os.environ.get("RESPONSE_STYLE", "aws").strip().lower()
     upstream_base = os.environ.get("UPSTREAM_BASE_URL", "").strip()
+    upstream_auth_mode = os.environ.get("UPSTREAM_AUTH_MODE", "passthrough").strip().lower()
+    bedrock_api_mode = os.environ.get("BEDROCK_API_MODE", "openai").strip().lower()
+    upstream_sigv4_service = os.environ.get("UPSTREAM_SIGV4_SERVICE", "bedrock").strip()
+    upstream_sigv4_region = os.environ.get("UPSTREAM_SIGV4_REGION", os.environ.get("AWS_REGION", "")).strip()
+    model_ids = tuple(m.strip() for m in os.environ.get("MODEL_IDS", "").split(",") if m.strip())
     ttl = int(os.environ.get("CONFIG_TTL_SECONDS", "10"))
     upstream_timeout = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
+    inbound_auth_mode = os.environ.get("INBOUND_AUTH_MODE", "none").strip().lower()
+    proxy_api_key = os.environ.get("PROXY_API_KEY", "")
+    if inbound_auth_mode not in {"none", "bearer"}:
+        raise RuntimeError("INBOUND_AUTH_MODE must be none or bearer")
+    if inbound_auth_mode == "bearer" and not proxy_api_key:
+        raise RuntimeError("PROXY_API_KEY must be set when INBOUND_AUTH_MODE=bearer")
 
     if loader is None:
         if not injector_id:
             raise RuntimeError("INJECTOR_ID must be set to scope the SSM parameter subtree")
         loader = SSMConfigLoader(f"/bedrock-fis/{injector_id}/", ttl=ttl)
 
+    def require_inbound_auth() -> Optional[Response]:
+        """Authenticate protected provider and observability endpoints."""
+        if inbound_auth_mode == "none":
+            return None
+        supplied = request.headers.get("Authorization", "")
+        expected = f"Bearer {proxy_api_key}"
+        if not hmac.compare_digest(supplied, expected):
+            return _unauthorized_response()
+        return None
+
     @app.get("/healthz")
     def healthz() -> Response:
         """Liveness probe — always 200, never faulted, never forwarded."""
         return Response(json.dumps({"status": "ok"}), status=200, content_type="application/json")
 
+    @app.get("/v1/models")
+    def models() -> Response:
+        """Return the configured model catalog for AgentCore target discovery."""
+        auth_error = require_inbound_auth()
+        if auth_error is not None:
+            return auth_error
+        created = int(time.time())
+        return Response(
+            json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": model_id, "object": "model", "created": created, "owned_by": "bedrock-fis"}
+                        for model_id in model_ids
+                    ],
+                }
+            ),
+            status=200,
+            content_type="application/json",
+        )
+
     @app.get("/injector-status")
     def injector_status() -> Response:
         """Report the current (cached) injector config for observability/demo."""
+        auth_error = require_inbound_auth()
+        if auth_error is not None:
+            return auth_error
         cfg = loader.get()
         return Response(
             json.dumps(
@@ -474,7 +697,10 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
                     ],
                     "execution_id": cfg.execution_id,
                     "passthrough_mode": passthrough_mode,
+                    "upstream_auth_mode": upstream_auth_mode,
+                    "bedrock_api_mode": bedrock_api_mode,
                     "response_style": response_style,
+                    "inbound_auth_mode": inbound_auth_mode,
                 }
             ),
             status=200,
@@ -491,12 +717,14 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
         against the rules (first match wins); a request whose model matches no
         rule is never faulted.
         """
+        auth_error = require_inbound_auth()
+        if auth_error is not None:
+            return auth_error
         cfg = loader.get()
 
         rule = None
-        model = ""
+        model = _extract_model(path)
         if cfg.active:
-            model = _extract_model(path)
             rule = cfg.match(model)
 
         faulted = False
@@ -529,13 +757,25 @@ def create_app(loader: Optional[SSMConfigLoader] = None) -> Flask:
         # Pass-through (baseline) traffic.
         if passthrough_mode == "echo":
             return _echo_success(response_style)
+        if bedrock_api_mode == "converse":
+            if not model:
+                body = {"error": {"message": "request model is required for Bedrock Converse mode", "type": "invalid_request_error", "code": "invalid_request_error", "param": "model"}}
+                return Response(json.dumps(body), status=400, content_type="application/json")
+            return _forward_bedrock_converse(model, upstream_timeout, upstream_sigv4_region)
         if not upstream_base:
             # Misconfiguration guard: forward mode needs an upstream. Fail open to
             # a clear 200 echo rather than erroring, so the injector never becomes
             # the outage.
             logger.warning("forward mode but no UPSTREAM_BASE_URL; echoing baseline")
             return _echo_success(response_style)
-        return _forward_upstream(upstream_base, "/" + path, upstream_timeout)
+        return _forward_upstream(
+            upstream_base,
+            "/" + path,
+            upstream_timeout,
+            upstream_auth_mode,
+            upstream_sigv4_service,
+            upstream_sigv4_region,
+        )
 
     return app
 

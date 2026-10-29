@@ -1,11 +1,20 @@
 schemaVersion: '0.3'
-description: 'Run a bounded Bedrock gateway fault-injection experiment by toggling the injector config in SSM Parameter Store (enable, hold, disable, with rollback). The injector reads /bedrock-fis/{InjectorId}/* and fails OPEN to pass-through when inactive or absent.'
+description: 'Run a bounded fault-injection experiment against a gateway egress proxy by toggling its SSM configuration (enable, hold, disable, with rollback). GatewayType records whether the setup is AgentCore or LiteLLM on EC2/ECS/EKS; the gateway owner changes and restores the provider/upstream endpoint separately. The injector reads /bedrock-fis/{InjectorId}/* and fails open to real Bedrock pass-through when inactive or absent.'
 assumeRole: '{{ AutomationAssumeRole }}'
 
 parameters:
   InjectorId:
     type: String
     description: 'Injector id (used as the /bedrock-fis/{injector_id}/ SSM parameter prefix; must equal the injector container INJECTOR_ID env var)'
+  GatewayType:
+    type: String
+    description: 'Gateway setup being tested; context only. The gateway owner changes and restores the provider/upstream endpoint.'
+    default: 'agentcore'
+    allowedValues:
+      - 'agentcore'
+      - 'llm-proxy-ec2'
+      - 'llm-proxy-ecs'
+      - 'llm-proxy-eks'
   FaultType:
     type: String
     description: 'Which Bedrock-accurate transient error to emit'
@@ -35,8 +44,20 @@ parameters:
     description: 'IAM role ARN for SSM Automation to assume'
 
 mainSteps:
-  # --- Enable: write config first, set active=true LAST so a partially-written
-  #     config is never briefly live. ---
+  # --- Enable: write context and config first, set active=true LAST so a
+  #     partially-written config is never briefly live. ---
+  - name: SetGatewayType
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/bedrock-fis/{{ InjectorId }}/gateway_type'
+      Value: '{{ GatewayType }}'
+      Type: String
+      Overwrite: true
+
   - name: SetFaultRate
     action: 'aws:executeAwsApi'
     onFailure: 'Abort'
@@ -155,6 +176,7 @@ mainSteps:
       Service: ssm
       Api: DeleteParameters
       Names:
+        - '/bedrock-fis/{{ InjectorId }}/gateway_type'
         - '/bedrock-fis/{{ InjectorId }}/active'
         - '/bedrock-fis/{{ InjectorId }}/fault_rate'
         - '/bedrock-fis/{{ InjectorId }}/fault_type'
@@ -184,6 +206,7 @@ mainSteps:
       Service: ssm
       Api: DeleteParameters
       Names:
+        - '/bedrock-fis/{{ InjectorId }}/gateway_type'
         - '/bedrock-fis/{{ InjectorId }}/active'
         - '/bedrock-fis/{{ InjectorId }}/fault_rate'
         - '/bedrock-fis/{{ InjectorId }}/fault_type'

@@ -2,14 +2,33 @@
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "AllowInjectorToReadItsOwnParameters",
+            "Sid": "AllowInjectorToReadItsOwnFaultConfiguration",
             "Effect": "Allow",
             "Action": [
-                "ssm:GetParametersByPath",
+                "ssm:GetParameter",
                 "ssm:GetParameters",
-                "ssm:GetParameter"
+                "ssm:GetParametersByPath"
             ],
             "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:parameter/bedrock-fis/<YOUR INJECTOR ID>/*"
+        },
+        {
+            "Sid": "AllowInjectorToInvokeSelectedBedrockTestModels",
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:InvokeModelWithResponseStream"
+            ],
+            "Resource": [
+                "arn:aws:bedrock:<YOUR REGION>::foundation-model/openai.gpt-oss-120b-1:0",
+                "arn:aws:bedrock:<YOUR REGION>::foundation-model/qwen.qwen3-coder-next",
+                "arn:aws:bedrock:<YOUR REGION>::foundation-model/deepseek.v3.2",
+                "arn:aws:bedrock:<YOUR REGION>::foundation-model/mistral.mistral-large-3-675b-instruct",
+                "arn:aws:bedrock:<YOUR REGION>:<YOUR AWS ACCOUNT>:inference-profile/us.anthropic.claude-opus-4-6-v1",
+                "arn:aws:bedrock:<YOUR REGION>:<YOUR AWS ACCOUNT>:inference-profile/us.openai.gpt-6.1-sol",
+                "arn:aws:bedrock:<YOUR REGION>::foundation-model/anthropic.claude-opus-4-6-v1",
+                "arn:aws:bedrock:<PROFILE REGION>::foundation-model/anthropic.claude-opus-4-6-v1",
+                "arn:aws:bedrock:<PROFILE REGION>::foundation-model/openai.gpt-6.1-sol"
+            ]
         }
     ]
 }

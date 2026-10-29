@@ -11,6 +11,7 @@ Browse the experiment directories to find templates for various fault injection 
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
 - **AI Agents (Amazon Bedrock AgentCore)**: `agentcore-strands-agent-faults/`
+- **Bedrock Gateway Egress**: `bedrock-gateway-fault-injection/`
 
 Each experiment directory contains:
 - Complete FIS experiment template (JSON)
